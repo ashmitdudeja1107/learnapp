@@ -5,7 +5,7 @@ import tempfile
 import os
 
 import logging
-
+from datetime import datetime, timedelta
 import tempfile
 from services.quiz_service import QuizService
 from services.llm_service import LLMService, create_llm_service
@@ -40,17 +40,42 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 
 # Create a response model for the wrapped format
-class QuizResponse(BaseModel):
-    questions: List[QuizQuestion]
+quiz_sessions = {}
 
-@router.post("/generate", response_model=QuizResponse)
+class SimpleAnswersRequest(BaseModel):
+    session_id: str
+    answers: List[str]  # ["B", "A", "B"]
+
+def store_quiz_session(questions: List[QuizQuestion]) -> str:
+    """Store quiz questions and return session ID"""
+    session_id = f"quiz_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    quiz_sessions[session_id] = {
+        'questions': questions,
+        'created_at': datetime.now(),
+        'expires_at': datetime.now() + timedelta(hours=24)
+    }
+    return session_id
+
+def clean_expired_sessions():
+    """Remove expired quiz sessions"""
+    current_time = datetime.now()
+    expired_sessions = [
+        session_id for session_id, data in quiz_sessions.items()
+        if data['expires_at'] < current_time
+    ]
+    for session_id in expired_sessions:
+        del quiz_sessions[session_id]
+
+# ROUTE 1: Generate Quiz (Modified to include session)
+@router.post("/generate")
 async def generate_quiz_from_uploaded_file(
     file: UploadFile = File(...),
-    num_questions: int = Form(5),
+    num_questions: int = Form(8),
     difficulty: str = Form("medium")
 ):
     """
-    Generate quiz questions from uploaded document using Llama3
+    Generate quiz questions from uploaded document
+    Returns: {"session_id": "...", "questions": [...]}
     """
     tmp_file_path = None
     try:
@@ -77,7 +102,7 @@ async def generate_quiz_from_uploaded_file(
                 detail="Difficulty must be one of: easy, medium, hard"
             )
         
-        # Read file content first
+        # Read file content
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -86,59 +111,73 @@ async def generate_quiz_from_uploaded_file(
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
         tmp_file_path = tmp_file.name
         
-        try:
-            # Write content and close file properly
-            tmp_file.write(content)
-            tmp_file.flush()
-            tmp_file.close()
-            
-            # Verify file was created successfully
-            if not os.path.exists(tmp_file_path) or os.path.getsize(tmp_file_path) == 0:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="Failed to create temporary file"
-                )
-            
-            logger.info(f"Created temporary file: {tmp_file_path}, size: {os.path.getsize(tmp_file_path)}")
-            
-            # Process document
-            documents = quiz_service.process_document_for_quiz(tmp_file_path)
-            if not documents:
-                raise HTTPException(
-                    status_code=422, 
-                    detail="Could not process the uploaded document. Please ensure the file is readable and contains text content."
-                )
-            
-            # Generate quiz questions - this returns {"questions": [...]}
-            quiz_response = quiz_service.generate_quiz_questions(
-                num_questions=num_questions,
-                difficulty=difficulty,
-                question_type="multiple_choice"
+        # Write content and close file properly
+        tmp_file.write(content)
+        tmp_file.flush()
+        tmp_file.close()
+        
+        # Verify file was created successfully
+        if not os.path.exists(tmp_file_path) or os.path.getsize(tmp_file_path) == 0:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to create temporary file"
             )
-            
-            # Validate that we have questions
-            if not quiz_response.get('questions'):
-                raise HTTPException(
-                    status_code=422, 
-                    detail="Could not generate questions from the uploaded document. The document may not contain enough content for quiz generation."
-                )
-            
-            # Return the full dictionary structure with "questions" wrapper
-            return quiz_response
-            
-        except Exception as e:
-            # Re-raise HTTPExceptions as-is
-            if isinstance(e, HTTPException):
-                raise
-            else:
-                logger.error(f"Error in quiz generation pipeline: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Error generating quiz with Llama3: {str(e)}")
-                
+        
+        logger.info(f"Created temporary file: {tmp_file_path}, size: {os.path.getsize(tmp_file_path)}")
+        
+        # Process document
+        documents = quiz_service.process_document_for_quiz(tmp_file_path)
+        if not documents:
+            raise HTTPException(
+                status_code=422, 
+                detail="Could not process the uploaded document. Please ensure the file is readable and contains text content."
+            )
+        
+        # Generate quiz questions
+        quiz_response = quiz_service.generate_quiz_questions(
+            num_questions=num_questions,
+            difficulty=difficulty,
+            question_type="multiple_choice"
+        )
+        
+        # Validate that we have questions
+        if not quiz_response.get('questions'):
+            raise HTTPException(
+                status_code=422, 
+                detail="Could not generate questions from the uploaded document. The document may not contain enough content for quiz generation."
+            )
+        
+        # Convert to QuizQuestion objects for storage
+        questions = []
+        for q_data in quiz_response['questions']:
+            question = QuizQuestion(
+                id=q_data['id'],
+                question=q_data['question'],
+                options=q_data['options'],
+                correct_answer=q_data['correct_answer'],
+                explanation=q_data.get('explanation', ''),
+                difficulty=DifficultyLevel(q_data.get('difficulty', difficulty)),
+                topic=q_data.get('topic', 'General')
+            )
+            questions.append(question)
+        
+        # Store questions and get session ID
+        session_id = store_quiz_session(questions)
+        
+        # Clean expired sessions
+        clean_expired_sessions()
+        
+        # Return quiz with session ID
+        return {
+            "session_id": session_id,
+            "questions": quiz_response['questions']
+        }
+        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in generate_quiz_from_upload: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error generating quiz with Llama3: {str(e)}")
+        logger.error(f"Unexpected error in generate_quiz: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating quiz: {str(e)}")
     finally:
         # Clean up temporary file
         if tmp_file_path and os.path.exists(tmp_file_path):
@@ -148,20 +187,26 @@ async def generate_quiz_from_uploaded_file(
             except Exception as cleanup_error:
                 logger.warning(f"Failed to clean up temporary file {tmp_file_path}: {str(cleanup_error)}")
 
+class QuizGenerationRequest(BaseModel):
+    num_questions: int
+    difficulty: str 
+    question_type: Optional[str] = "multiple_choice"
 
-@router.post("/generate-from-text", response_model=List[QuizQuestion])
-async def generate_quiz_from_text(
-    text_content: str,
+class TextQuizRequest(BaseModel):
+    text_content: str
     request: QuizGenerationRequest
-):
+
+@router.post("/generate-from-text")
+async def generate_quiz_from_text(data: TextQuizRequest):
     """
     Generate quiz questions directly from provided text content using Llama3
+    Returns: {"session_id": "...", "questions": [...]}
     """
     try:
-        if not text_content.strip():
+        if not data.text_content.strip():
             raise HTTPException(status_code=400, detail="Text content cannot be empty")
         
-        if len(text_content) < 100:
+        if len(data.text_content) < 100:
             raise HTTPException(
                 status_code=400, 
                 detail="Text content too short. Please provide at least 100 characters for meaningful quiz generation."
@@ -169,10 +214,10 @@ async def generate_quiz_from_text(
         
         # Use Llama3 service for text-based quiz generation
         questions_data = llm_service.generate_quiz_questions(
-            content=text_content,
-            num_questions=request.num_questions,
-            difficulty=request.difficulty.value,
-            question_type=request.question_type.value
+            content=data.text_content,
+            num_questions=data.request.num_questions,
+            difficulty=data.request.difficulty,
+            question_type=data.request.question_type
         )
         
         if not questions_data:
@@ -183,33 +228,72 @@ async def generate_quiz_from_text(
         
         # Convert to QuizQuestion objects
         questions = []
+        quiz_questions_for_response = []  # For the response format
+        
         for i, q_data in enumerate(questions_data):
             try:
-                # Create QuizQuestion from the Llama3 response
-                question = QuizQuestion(
+                # Handle different option formats
+                options = []
+                for j, opt in enumerate(q_data['options']):
+                    if isinstance(opt, dict):
+                        options.append({
+                            "label": opt.get('label', chr(65 + j)),
+                            "text": opt.get('text', str(opt)),
+                            "is_correct": opt.get('is_correct', False)
+                        })
+                    else:
+                        options.append({
+                            "label": chr(65 + j),  # A, B, C, D
+                            "text": str(opt),
+                            "is_correct": False
+                        })
+                
+                # Create QuizQuestion object for storage
+                question_obj = QuizQuestion(
                     id=q_data.get('id', f'q{i+1}'),
                     question=q_data['question'],
-                    options=[
-                        {
-                            "label": opt['label'],
-                            "text": opt['text'],
-                            "is_correct": opt.get('is_correct', False)
-                        }
-                        for opt in q_data['options']
-                    ],
+                    options=options,
                     correct_answer=q_data['correct_answer'],
                     explanation=q_data.get('explanation', ''),
-                    difficulty=DifficultyLevel(q_data.get('difficulty', request.difficulty.value)),
+                    difficulty=DifficultyLevel(q_data.get('difficulty', data.request.difficulty)),
                     topic=q_data.get('topic', 'General')
                 )
-                questions.append(question)
+                questions.append(question_obj)
+                
+                # Create question data for response (similar to the /generate endpoint)
+                question_response = {
+                    "id": q_data.get('id', f'q{i+1}'),
+                    "question": q_data['question'],
+                    "options": options,
+                    "correct_answer": q_data['correct_answer'],
+                    "explanation": q_data.get('explanation', ''),
+                    "difficulty": q_data.get('difficulty', data.request.difficulty),
+                    "topic": q_data.get('topic', 'General')
+                }
+                quiz_questions_for_response.append(question_response)
+                
             except KeyError as e:
                 raise HTTPException(
                     status_code=422,
                     detail=f"Invalid question format from Llama3: missing {str(e)}"
                 )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Error processing question {i+1}: {str(e)}"
+                )
         
-        return questions
+        # Store questions and get session ID (same as /generate endpoint)
+        session_id = store_quiz_session(questions)
+        
+        # Clean expired sessions
+        clean_expired_sessions()
+        
+        # Return quiz with session ID (matching /generate endpoint format)
+        return {
+            "session_id": session_id,
+            "questions": quiz_questions_for_response
+        }
         
     except HTTPException:
         raise
@@ -221,203 +305,56 @@ class QuizEvaluationRequest(BaseModel):
     questions: List[QuizQuestion]
     submission: QuizSubmission
 
+
 @router.post("/evaluate", response_model=QuizResult)
-async def evaluate_quiz(request: QuizEvaluationRequest):
+async def evaluate_quiz(request: SimpleAnswersRequest):
     """
-    Evaluate quiz answers and return results using Llama3
+    Evaluate quiz with simple answers
+    Input: {"session_id": "quiz_...", "answers": ["B", "A", "B"]}
     """
     try:
-        if not request.questions:
-            raise HTTPException(status_code=400, detail="No questions provided for evaluation")
+        # Clean expired sessions first
+        clean_expired_sessions()
         
-        if not request.submission.answers:
-            raise HTTPException(status_code=400, detail="No answers provided for evaluation")
+        # Get stored questions
+        if request.session_id not in quiz_sessions:
+            raise HTTPException(
+                status_code=404, 
+                detail="Quiz session not found or expired. Please generate a new quiz."
+            )
         
-        # Convert answers to dictionary format
-        user_answers = {answer.question_id: answer.selected_answer for answer in request.submission.answers}
+        session_data = quiz_sessions[request.session_id]
+        questions = session_data['questions']
         
-        # Evaluate quiz using the service (powered by Llama3)
-        results = quiz_service.evaluate_quiz(request.questions, user_answers)
+        # Validate answer count
+        if len(request.answers) != len(questions):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Expected {len(questions)} answers, got {len(request.answers)}"
+            )
+        
+        # Validate answer format
+        valid_answers = {'A', 'B', 'C', 'D'}
+        for i, answer in enumerate(request.answers):
+            if answer not in valid_answers:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid answer '{answer}' at position {i+1}. Must be A, B, C, or D"
+                )
+        
+        # Create user answers mapping
+        user_answers = {}
+        for i, answer in enumerate(request.answers):
+            question_id = questions[i].id
+            user_answers[question_id] = answer
+        
+        # Evaluate quiz using existing service
+        results = quiz_service.evaluate_quiz(questions, user_answers)
         
         return results
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error evaluating quiz with Llama3: {str(e)}")
-
-@router.post("/explain-answer")
-async def explain_answer(
-    question: str,
-    correct_answer: str,
-    user_answer: str,
-    context: str = ""
-):
-    """
-    Get detailed explanation for a quiz answer using Llama3
-    """
-    try:
-        explanation = llm_service.evaluate_answer_explanation(
-            question=question,
-            correct_answer=correct_answer,
-            user_answer=user_answer,
-            context=context
-        )
-        
-        return {
-            "question": question,
-            "correct_answer": correct_answer,
-            "user_answer": user_answer,
-            "explanation": explanation,
-            "generated_by": "llama3"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating explanation with Llama3: {str(e)}")
-
-@router.get("/health")
-async def quiz_health_check():
-    """
-    Health check endpoint for quiz service and Llama3
-    """
-    try:
-        # Check quiz service
-        quiz_health = {"status": "healthy", "service": "quiz"}
-        
-        # Check Llama3 service
-        llm_health = llm_service.health_check()
-        
-        return {
-            "overall_status": "healthy" if llm_health["status"] == "healthy" else "degraded",
-            "quiz_service": quiz_health,
-            "llm_service": {
-                **llm_health,
-                "model": "llama3",
-                "provider": "ollama"
-            },
-            "timestamp": llm_health["timestamp"]
-        }
-        
-    except Exception as e:
-        return {
-            "overall_status": "unhealthy",
-            "error": str(e),
-            "quiz_service": {"status": "unknown"},
-            "llm_service": {
-                "status": "unhealthy",
-                "model": "llama3",
-                "provider": "ollama"
-            }
-        }
-
-@router.get("/config")
-async def get_quiz_configuration():
-    """
-    Get quiz service configuration for Llama3
-    """
-    return {
-        "difficulties": [
-            {"value": "easy", "label": "Easy", "description": "Basic comprehension questions"},
-            {"value": "medium", "label": "Medium", "description": "Moderate analysis questions"},
-            {"value": "hard", "label": "Hard", "description": "Complex reasoning questions"}
-        ],
-        "question_limits": {
-            "min_questions": 1,
-            "max_questions": 20,
-            "default_questions": 5,
-            "recommended_questions": [5, 10, 15, 20]
-        },
-        "supported_formats": [".pdf", ".txt", ".docx", ".doc"],
-        "question_types": ["multiple_choice", "true_false", "fill_blank"],
-        "llm_provider": "ollama",
-        "llm_model": "llama3",
-        "environment": "local_development"
-    }
-
-@router.get("/model-info")
-async def get_model_info():
-    """
-    Get information about the local Llama3 model
-    """
-    try:
-        return {
-            "model_name": "llama3",
-            "provider": "ollama",
-            "environment": "local",
-            "temperature": 0.7,
-            "max_tokens": 2000,
-            "status": "active"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting model info: {str(e)}")
-
-@router.get("/document-summary")
-async def get_document_summary():
-    """
-    Get summary of the currently processed document (generated by Llama3)
-    """
-    try:
-        summary = quiz_service.get_document_summary()
-        return {
-            **summary,
-            "generated_by": "llama3"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting document summary: {str(e)}")
-
-@router.post("/cleanup")
-async def cleanup_resources():
-    """
-    Clean up quiz service resources
-    """
-    try:
-        quiz_service.cleanup_resources()
-        return {"status": "success", "message": "Resources cleaned up successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error cleaning up resources: {str(e)}")
-
-@router.post("/restart-llama3")
-async def restart_llama3_service():
-    """
-    Restart the local Llama3 service connection
-    """
-    try:
-        global llm_service, quiz_service
-        
-        # Reinitialize local Llama3 service
-        llm_service = initialize_llama3_service()
-        quiz_service = QuizService(llm_service.model)
-        
-        return {
-            "status": "success", 
-            "message": "Local Llama3 service restarted successfully",
-            "model": "llama3",
-            "provider": "ollama"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error restarting local Llama3 service: {str(e)}")
-
-# Legacy endpoints for backward compatibility
-@router.get("/difficulties")
-async def get_difficulty_levels():
-    """
-    Get available difficulty levels (legacy endpoint)
-    """
-    return {
-        "difficulties": [
-            {"value": "easy", "label": "Easy"},
-            {"value": "medium", "label": "Medium"},
-            {"value": "hard", "label": "Hard"}
-        ]
-    }
-
-@router.get("/question-limits")
-async def get_question_limits():
-    """
-    Get min/max limits for number of questions (legacy endpoint)
-    """
-    return {
-        "min_questions": 1,
-        "max_questions": 20,
-        "default_questions": 5
-    }
+        logger.error(f"Error evaluating quiz: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error evaluating quiz: {str(e)}")

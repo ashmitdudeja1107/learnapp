@@ -1,12 +1,15 @@
-# Improved RAG System with Better Search Strategies
+# Updated RAG System with Better Document Matching and Summarization
 import chromadb
 import PyPDF2
 from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 import uuid
 import io
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 class RAGSystem:
     def __init__(self, collection_name: str = "ai_tutor_docs"):
@@ -35,6 +38,14 @@ class RAGSystem:
         doc_count = self.collection.count()
         print(f"Collection initialized with {doc_count} documents")
     
+    def normalize_filename(self, filename: str) -> str:
+        """Normalize filename for consistent storage and retrieval"""
+        # Remove path separators and normalize
+        normalized = filename.replace('\\', '/').split('/')[-1]
+        # Remove extra spaces and normalize case
+        normalized = normalized.strip()
+        return normalized
+    
     def extract_text_from_pdf(self, pdf_content: bytes) -> str:
         """Extract text from PDF bytes"""
         try:
@@ -54,10 +65,14 @@ class RAGSystem:
             raise
     
     def add_document(self, content: str, filename: str) -> str:
-        """Add document to vector store"""
+        """Add document to vector store with normalized filename"""
         try:
             if not content.strip():
                 raise ValueError("Document content is empty")
+            
+            # Normalize filename
+            normalized_filename = self.normalize_filename(filename)
+            logger.info(f"Adding document with normalized filename: {normalized_filename}")
             
             # Split text into chunks
             chunks = self.text_splitter.split_text(content)
@@ -72,8 +87,16 @@ class RAGSystem:
             # Create unique IDs for chunks
             ids = [str(uuid.uuid4()) for _ in chunks]
             
-            # Metadata for each chunk
-            metadatas = [{"filename": filename, "chunk_index": i} for i in range(len(chunks))]
+            # Metadata for each chunk with normalized filename
+            metadatas = [
+                {
+                    "filename": normalized_filename,
+                    "original_filename": filename,  # Keep original for reference
+                    "chunk_index": i,
+                    "total_chunks": len(chunks)
+                } 
+                for i in range(len(chunks))
+            ]
             
             # Add to ChromaDB
             self.collection.add(
@@ -83,7 +106,7 @@ class RAGSystem:
                 ids=ids
             )
             
-            result = f"Added {len(chunks)} chunks from {filename}"
+            result = f"Added {len(chunks)} chunks from {normalized_filename}"
             print(result)
             print(f"Collection now has {self.collection.count()} total documents")
             return result
@@ -105,6 +128,147 @@ class RAGSystem:
             print(error_msg)
             raise Exception(error_msg)
     
+    def get_available_documents(self) -> List[Dict[str, str]]:
+        """Get list of all available documents with both normalized and original filenames"""
+        try:
+            search_results = self.collection.get()
+            if not search_results or not search_results.get("metadatas"):
+                return []
+            
+            # Extract unique filenames with metadata
+            documents = {}
+            for metadata in search_results["metadatas"]:
+                if metadata and "filename" in metadata:
+                    filename = metadata["filename"]
+                    original_filename = metadata.get("original_filename", filename)
+                    chunk_count = documents.get(filename, {}).get("chunk_count", 0) + 1
+                    
+                    documents[filename] = {
+                        "filename": filename,
+                        "original_filename": original_filename,
+                        "chunk_count": chunk_count
+                    }
+            
+            # Convert to list and sort
+            doc_list = list(documents.values())
+            doc_list.sort(key=lambda x: x["filename"].lower())
+            
+            logger.info(f"Available documents: {[doc['filename'] for doc in doc_list]}")
+            return doc_list
+            
+        except Exception as e:
+            logger.error(f"Error getting available documents: {str(e)}")
+            return []
+    
+    def find_document_by_name(self, filename: str) -> Optional[str]:
+        """Find document by various matching strategies"""
+        try:
+            available_docs = self.get_available_documents()
+            
+            if not available_docs:
+                logger.warning("No documents available in collection")
+                return None
+            
+            # Normalize the search filename
+            search_filename = self.normalize_filename(filename)
+            logger.info(f"Searching for document: '{search_filename}'")
+            
+            # Strategy 1: Exact match (normalized)
+            for doc in available_docs:
+                if doc["filename"] == search_filename:
+                    logger.info(f"Found exact match: {doc['filename']}")
+                    return doc["filename"]
+            
+            # Strategy 2: Case-insensitive match
+            search_lower = search_filename.lower()
+            for doc in available_docs:
+                if doc["filename"].lower() == search_lower:
+                    logger.info(f"Found case-insensitive match: {doc['filename']}")
+                    return doc["filename"]
+            
+            # Strategy 3: Partial match (contains)
+            for doc in available_docs:
+                if search_lower in doc["filename"].lower() or doc["filename"].lower() in search_lower:
+                    logger.info(f"Found partial match: {doc['filename']}")
+                    return doc["filename"]
+            
+            # Strategy 4: Match without extension
+            search_no_ext = search_filename.rsplit('.', 1)[0] if '.' in search_filename else search_filename
+            for doc in available_docs:
+                doc_no_ext = doc["filename"].rsplit('.', 1)[0] if '.' in doc["filename"] else doc["filename"]
+                if search_no_ext.lower() == doc_no_ext.lower():
+                    logger.info(f"Found extension-agnostic match: {doc['filename']}")
+                    return doc["filename"]
+            
+            # Strategy 5: Match against original filename
+            for doc in available_docs:
+                if doc.get("original_filename", "").lower() == search_lower:
+                    logger.info(f"Found original filename match: {doc['filename']}")
+                    return doc["filename"]
+            
+            logger.warning(f"No match found for '{filename}' among available documents: {[doc['filename'] for doc in available_docs]}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding document by name: {str(e)}")
+            return None
+    
+    def get_document_content(self, filename: str) -> Tuple[List[str], List[Dict], bool]:
+        """Get all content chunks for a specific document"""
+        try:
+            # Find the document
+            matched_filename = self.find_document_by_name(filename)
+            
+            if not matched_filename:
+                logger.error(f"Document '{filename}' not found")
+                return [], [], False
+            
+            logger.info(f"Retrieving content for document: {matched_filename}")
+            
+            # Try direct query first
+            try:
+                search_results = self.collection.get(
+                    where={"filename": matched_filename}
+                )
+                
+                if search_results and search_results.get("documents"):
+                    logger.info(f"Direct query found {len(search_results['documents'])} chunks")
+                    return (
+                        search_results["documents"],
+                        search_results.get("metadatas", []),
+                        True
+                    )
+            except Exception as e:
+                logger.warning(f"Direct query failed: {e}")
+            
+            # Fallback: Manual filtering
+            logger.info("Trying manual filtering approach...")
+            all_results = self.collection.get()
+            
+            if not all_results or not all_results.get("documents"):
+                logger.error("No documents found in collection")
+                return [], [], False
+            
+            # Filter manually
+            filtered_docs = []
+            filtered_metas = []
+            
+            for doc, meta in zip(all_results["documents"], all_results.get("metadatas", [])):
+                if meta and meta.get("filename") == matched_filename:
+                    filtered_docs.append(doc)
+                    filtered_metas.append(meta)
+            
+            if filtered_docs:
+                logger.info(f"Manual filtering found {len(filtered_docs)} chunks")
+                return filtered_docs, filtered_metas, True
+            else:
+                logger.error(f"No content found for document: {matched_filename}")
+                return [], [], False
+                
+        except Exception as e:
+            logger.error(f"Error getting document content: {str(e)}")
+            return [], [], False
+    
     def search_similar_enhanced(self, query: str, n_results: int = 10) -> Dict:
         """Enhanced search with multiple strategies"""
         try:
@@ -125,7 +289,6 @@ class RAGSystem:
             )
             
             # Strategy 2: Keyword-based filtering for better results
-            # Extract key terms from query
             key_terms = self.extract_key_terms(query)
             print(f"Key terms extracted: {key_terms}")
             
@@ -146,12 +309,10 @@ class RAGSystem:
     
     def extract_key_terms(self, query: str) -> List[str]:
         """Extract key terms from query for better matching"""
-        # Remove common stop words and extract meaningful terms
         stop_words = {'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 
                      'has', 'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the', 
                      'to', 'was', 'will', 'with', 'few', 'things', 'does', 'not', 'do'}
         
-        # Clean and split query
         words = re.findall(r'\b\w+\b', query.lower())
         key_terms = [word for word in words if word not in stop_words and len(word) > 2]
         
@@ -161,7 +322,6 @@ class RAGSystem:
         """Generate alternative query phrasings"""
         alternatives = []
         
-        # For "A few things that science does not do"
         if "does not do" in original_query.lower():
             alternatives.extend([
                 "what science cannot do",
@@ -173,7 +333,6 @@ class RAGSystem:
                 "not scientific"
             ])
         
-        # Add more patterns as needed
         if "science" in original_query.lower():
             alternatives.extend([
                 "scientific method",
@@ -196,7 +355,7 @@ class RAGSystem:
         if not all_results["documents"] or (all_results["distances"] and min(all_results["distances"]) > 0.7):
             print("Primary search results poor, trying alternatives...")
             
-            for alt_query in alternatives[:3]:  # Try top 3 alternatives
+            for alt_query in alternatives[:3]:
                 try:
                     alt_embedding = self.embedding_model.encode([alt_query]).tolist()
                     alt_results = self.collection.query(
@@ -207,7 +366,6 @@ class RAGSystem:
                     if alt_results["documents"] and alt_results["documents"][0]:
                         print(f"Alternative query '{alt_query}' found {len(alt_results['documents'][0])} results")
                         
-                        # Add unique results
                         for doc, meta, dist in zip(
                             alt_results["documents"][0],
                             alt_results["metadatas"][0], 
@@ -216,7 +374,7 @@ class RAGSystem:
                             if doc not in all_results["documents"]:
                                 all_results["documents"].append(doc)
                                 all_results["metadatas"].append(meta)
-                                all_results["distances"].append(dist + 0.1)  # Slight penalty for alternative query
+                                all_results["distances"].append(dist + 0.1)
                                 
                 except Exception as e:
                     print(f"Error with alternative query '{alt_query}': {e}")
@@ -224,8 +382,7 @@ class RAGSystem:
         
         # Rerank by keyword presence
         if key_terms:
-            reranked_results = self.rerank_by_keywords(all_results, key_terms)
-            return reranked_results
+            return self.rerank_by_keywords(all_results, key_terms)
         
         return all_results
     
@@ -234,18 +391,14 @@ class RAGSystem:
         if not results["documents"]:
             return results
         
-        # Calculate keyword scores
         scored_results = []
         for doc, meta, dist in zip(results["documents"], results["metadatas"], results["distances"]):
             keyword_score = sum(1 for term in key_terms if term.lower() in doc.lower())
-            # Combine semantic similarity with keyword relevance
-            combined_score = dist - (keyword_score * 0.1)  # Lower is better
+            combined_score = dist - (keyword_score * 0.1)
             scored_results.append((doc, meta, dist, combined_score))
         
-        # Sort by combined score
         scored_results.sort(key=lambda x: x[3])
         
-        # Return reranked results
         return {
             "documents": [x[0] for x in scored_results],
             "metadatas": [x[1] for x in scored_results],
@@ -257,7 +410,7 @@ class RAGSystem:
         return self.search_similar_enhanced(query, n_results)
     
     def get_context_for_query(self, query: str, max_context_length: int = 3000) -> tuple:
-        """Get relevant context with improved search and larger context window"""
+        """Get relevant context with improved search"""
         try:
             search_results = self.search_similar_enhanced(query, n_results=10)
             
@@ -269,10 +422,9 @@ class RAGSystem:
             sources = set()
             total_length = 0
             
-            # Prioritize results with better scores (lower distances)
             sorted_results = sorted(
                 zip(search_results["documents"], search_results["metadatas"], search_results["distances"]),
-                key=lambda x: x[2]  # Sort by distance
+                key=lambda x: x[2]
             )
             
             print(f"Processing {len(sorted_results)} search results")
@@ -282,9 +434,8 @@ class RAGSystem:
                     context_chunks.append(doc)
                     sources.add(metadata["filename"])
                     total_length += len(doc)
-                    print(f"  Added chunk {i+1} from {metadata['filename']} (distance: {distance:.4f}, length: {len(doc)})")
+                    print(f"  Added chunk {i+1} from {metadata['filename']} (distance: {distance:.4f})")
                 else:
-                    print(f"  Skipped chunk {i+1} - would exceed max context length")
                     break
             
             context = "\n\n".join(context_chunks)
@@ -295,112 +446,52 @@ class RAGSystem:
             print(f"Error getting context: {str(e)}")
             return "", []
     
-    def debug_search_for_query(self, query: str) -> Dict:
-        """Debug method to understand why search results might not be optimal"""
+    def debug_collection_info(self) -> Dict:
+        """Debug method to get information about the collection"""
         try:
-            print(f"\n=== DEBUG SEARCH FOR: '{query}' ===")
+            print(f"\n=== COLLECTION DEBUG INFO ===")
             
-            # Get all documents and search through them manually
+            doc_count = self.collection.count()
+            print(f"Total documents in collection: {doc_count}")
+            
+            if doc_count == 0:
+                return {"total_docs": 0, "files": [], "sample_content": []}
+            
             all_docs = self.collection.get()
             
-            # Find documents containing key terms
-            key_terms = self.extract_key_terms(query)
-            print(f"Key terms: {key_terms}")
+            filenames = set()
+            for meta in all_docs.get('metadatas', []):
+                if meta and 'filename' in meta:
+                    filenames.add(meta['filename'])
             
-            matches = []
-            for i, (doc, meta) in enumerate(zip(all_docs['documents'], all_docs['metadatas'])):
-                score = 0
-                matched_terms = []
-                
-                for term in key_terms:
-                    if term.lower() in doc.lower():
-                        score += 1
-                        matched_terms.append(term)
-                
-                # Also check for the full query or parts of it
-                if query.lower() in doc.lower():
-                    score += 5
-                    matched_terms.append("FULL_QUERY")
-                
-                if score > 0:
-                    matches.append({
-                        "chunk_index": i,
-                        "filename": meta.get('filename', 'Unknown'),
-                        "score": score,
-                        "matched_terms": matched_terms,
-                        "content_preview": doc[:200] + "..."
-                    })
+            print(f"Unique files: {len(filenames)}")
+            for filename in sorted(filenames):
+                print(f"  - {filename}")
             
-            # Sort by score
-            matches.sort(key=lambda x: x['score'], reverse=True)
+            file_samples = {}
+            for i, (doc, meta) in enumerate(zip(all_docs.get('documents', []), all_docs.get('metadatas', []))):
+                if meta and 'filename' in meta:
+                    filename = meta['filename']
+                    if filename not in file_samples:
+                        file_samples[filename] = {
+                            'chunk_count': 0,
+                            'sample_content': doc[:300] + "..." if len(doc) > 300 else doc
+                        }
+                    file_samples[filename]['chunk_count'] += 1
             
-            print(f"Found {len(matches)} chunks with keyword matches:")
-            for match in matches[:5]:
-                print(f"  Score: {match['score']}, Terms: {match['matched_terms']}")
-                print(f"  Content: {match['content_preview']}")
+            print(f"\nFile details:")
+            for filename, info in file_samples.items():
+                print(f"  {filename}: {info['chunk_count']} chunks")
+                print(f"    Sample: {info['sample_content'][:100]}...")
                 print()
             
             return {
-                "query": query,
-                "key_terms": key_terms,
-                "matches": matches[:10]
+                "total_docs": doc_count,
+                "files": list(filenames),
+                "file_details": file_samples,
+                "sample_content": [doc[:200] for doc in all_docs.get('documents', [])[:3]]
             }
             
         except Exception as e:
-            print(f"Error in debug search: {str(e)}")
+            print(f"Error in debug_collection_info: {str(e)}")
             return {"error": str(e)}
-        
-        
-    def debug_collection_info(self) -> Dict:
-     """Debug method to get information about the collection"""
-     try:
-        print(f"\n=== COLLECTION DEBUG INFO ===")
-        
-        # Get basic collection stats
-        doc_count = self.collection.count()
-        print(f"Total documents in collection: {doc_count}")
-        
-        if doc_count == 0:
-            return {"total_docs": 0, "files": [], "sample_content": []}
-        
-        # Get all documents
-        all_docs = self.collection.get()
-        
-        # Get unique filenames
-        filenames = set()
-        for meta in all_docs.get('metadatas', []):
-            if meta and 'filename' in meta:
-                filenames.add(meta['filename'])
-        
-        print(f"Unique files: {len(filenames)}")
-        for filename in sorted(filenames):
-            print(f"  - {filename}")
-        
-        # Get sample content from each file
-        file_samples = {}
-        for i, (doc, meta) in enumerate(zip(all_docs.get('documents', []), all_docs.get('metadatas', []))):
-            if meta and 'filename' in meta:
-                filename = meta['filename']
-                if filename not in file_samples:
-                    file_samples[filename] = {
-                        'chunk_count': 0,
-                        'sample_content': doc[:300] + "..." if len(doc) > 300 else doc
-                    }
-                file_samples[filename]['chunk_count'] += 1
-        
-        print(f"\nFile details:")
-        for filename, info in file_samples.items():
-            print(f"  {filename}: {info['chunk_count']} chunks")
-            print(f"    Sample: {info['sample_content'][:100]}...")
-            print()
-        
-        return {
-            "total_docs": doc_count,
-            "files": list(filenames),
-            "file_details": file_samples,
-            "sample_content": [doc[:200] for doc in all_docs.get('documents', [])[:3]]
-        }
-        
-     except Exception as e:
-        print(f"Error in debug_collection_info: {str(e)}")
-        return {"error": str(e)}    

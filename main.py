@@ -70,16 +70,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for development
+## CORS middleware for development - CORRECTED
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173"],  # React dev server + Vite
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-# Dependency to get chat service
+)# Dependency to get chat service
 async def get_chat_service() -> ChatService:
     """Dependency to provide chat service instance"""
     if chat_service_instance is None:

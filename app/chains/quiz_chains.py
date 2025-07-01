@@ -291,56 +291,77 @@ class QuizGenerationPipeline:
     def __init__(self, quiz_chains: QuizChains, quiz_rag_service):
         self.chains = quiz_chains
         self.rag_service = quiz_rag_service
-    
     def generate_quiz_questions(self, 
-                              content_chunks: List[str], 
-                              num_questions: int = 5,
-                              difficulty: str = "medium",
-                              question_type: str = "multiple_choice") -> List[QuizQuestion]:
+                          content_chunks: List[str], 
+                          num_questions: int = 10,
+                          difficulty: str = "medium",
+                          question_type: str = "multiple_choice") -> List[QuizQuestion]:
         """Generate a complete set of quiz questions"""
         questions = []
-        
-        for i in range(min(num_questions, len(content_chunks))):
+    
+        if not content_chunks:
+           logger.error("No content chunks provided")
+           return questions
+    
+    # Generate the requested number of questions, cycling through content chunks if needed
+        attempts = 0
+        max_attempts = num_questions * 2  # Allow more attempts than questions needed
+    
+        while len(questions) < num_questions and attempts < max_attempts:
             try:
-                content = content_chunks[i]
-                
-                # Generate question based on type
+            # Use modulo to cycle through available content chunks
+                content_index = attempts % len(content_chunks)
+                content = content_chunks[content_index]
+            
+            # Skip empty or very short content
+                if not content or len(content.strip()) < 10:
+                    logger.warning(f"Skipping attempt {attempts+1}: insufficient content")
+                    attempts += 1
+                    continue
+            
+            # Generate question based on type
                 if question_type == "true_false":
                     question_data = self.chains.generate_true_false_question(content, difficulty)
                 else:
                     question_data = self.chains.generate_multiple_choice_question(content, difficulty)
-                
-                # Extract topic from content
+            
+            # Validate question_data structure
+                if not self._validate_question_data(question_data):
+                    logger.warning(f"Invalid question data for attempt {attempts+1}, skipping")
+                    attempts += 1
+                    continue
+            
+            # Extract topic from content
                 topics = self.chains.extract_topics(content)
                 topic = topics[0] if topics else "General"
-                
-                # Create QuizQuestion object
+            
+            # Create QuizQuestion object
                 options = []
-                for opt_text in question_data["options"]:
-                    # Handle different option formats
+                for opt_idx, opt_text in enumerate(question_data["options"]):
+                # Handle different option formats
                     if isinstance(opt_text, str):
                         if len(opt_text) > 2 and opt_text[1] == ')':
                             label = opt_text[0]  # Extract A, B, C, D
                             text = opt_text[3:]  # Remove "A) " prefix
                         else:
-                            # Fallback for malformed options
-                            label = chr(65 + len(options))  # A, B, C, D
-                            text = opt_text
+                        # Fallback for malformed options
+                           label = chr(65 + opt_idx)  # A, B, C, D
+                           text = opt_text
                     else:
-                        # Handle non-string options
-                        label = chr(65 + len(options))
+                    # Handle non-string options
+                        label = chr(65 + opt_idx)
                         text = str(opt_text)
-                    
-                    is_correct = (label == question_data["correct_answer"])
-                    
-                    options.append(QuizOption(
-                        label=label,
-                        text=text,
-                        is_correct=is_correct
-                    ))
                 
+                    is_correct = (label == question_data["correct_answer"])
+                
+                    options.append(QuizOption(
+                    label=label,
+                    text=text,
+                    is_correct=is_correct
+                    ))
+            
                 quiz_question = QuizQuestion(
-                    id=f"q_{i+1}",
+                    id=f"q_{len(questions)+1}",  # Use actual count instead of loop index
                     question=question_data["question"],
                     options=options,
                     correct_answer=question_data["correct_answer"],
@@ -348,12 +369,31 @@ class QuizGenerationPipeline:
                     difficulty=DifficultyLevel(difficulty),
                     topic=topic,
                     context=content[:200] + "..." if len(content) > 200 else content
-                )
-                
+                  )
+            
                 questions.append(quiz_question)
-                
+                attempts += 1
+            
             except Exception as e:
-                logger.error(f"Error generating question {i+1}: {str(e)}")
+                logger.error(f"Error generating question on attempt {attempts+1}: {str(e)}")
+                attempts += 1
+            # Don't continue immediately - try to generate more questions
                 continue
-        
+    
+        logger.info(f"Successfully generated {len(questions)} out of {num_questions} requested questions")
         return questions
+
+    def _validate_question_data(self, question_data: dict) -> bool:
+        """Validate that question_data has required fields"""
+        required_fields = ["question", "options", "correct_answer", "explanation"]
+    
+        for field in required_fields:
+            if field not in question_data:
+                logger.error(f"Missing required field: {field}")
+                return False
+    
+        if not isinstance(question_data["options"], list) or len(question_data["options"]) < 2:
+            logger.error("Invalid options: must be a list with at least 2 options")
+            return False
+    
+        return True

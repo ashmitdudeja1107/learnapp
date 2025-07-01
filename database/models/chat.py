@@ -26,3 +26,9 @@ class ChatResponse(BaseModel):
 class DocumentUpload(BaseModel):
     filename: str
     content: bytes
+    
+    
+class AddMessageRequest(BaseModel):
+    message: str
+    role: str = "user"  # "user", "assistant", or "system"
+    generate_response: Optional[bool] = False    

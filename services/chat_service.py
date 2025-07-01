@@ -4,8 +4,9 @@ from typing import Dict, List, Optional, Any
 from app.chains.chainmodel import TutorChains
 from app.memory.memorymodel import MemoryManager
 from app.rag.ragmodel import RAGSystem
-from database.models.chat import ChatRequest, ChatResponse
-
+from database.models.chat import ChatRequest, ChatResponse,AddMessageRequest
+from datetime import datetime
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,56 @@ class ChatService:
                 "error": f"Chat processing failed: {str(e)}",
                 "session_id": session_id or "error"
             }
+
+    def get_available_documents(self) -> List[str]:
+        """Get list of all available documents in the RAG system"""
+        try:
+            search_results = self.rag_system.collection.get()
+            if not search_results or not search_results.get("metadatas"):
+                return []
+            
+            # Extract unique filenames
+            filenames = set()
+            for metadata in search_results["metadatas"]:
+                if metadata and "filename" in metadata:
+                    filenames.add(metadata["filename"])
+            
+            return sorted(list(filenames))
+        except Exception as e:
+            logger.error(f"Error getting available documents: {str(e)}")
+            return []
+
+    def find_document_by_partial_name(self, filename: str) -> Optional[str]:
+        """Find document by partial filename match"""
+        try:
+            available_docs = self.get_available_documents()
+            
+            # First try exact match
+            if filename in available_docs:
+                return filename
+            
+            # Try case-insensitive match
+            filename_lower = filename.lower()
+            for doc in available_docs:
+                if doc.lower() == filename_lower:
+                    return doc
+            
+            # Try partial match (contains)
+            for doc in available_docs:
+                if filename_lower in doc.lower() or doc.lower() in filename_lower:
+                    return doc
+            
+            # Try without extension
+            filename_no_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            for doc in available_docs:
+                doc_no_ext = doc.rsplit('.', 1)[0] if '.' in doc else doc
+                if filename_no_ext.lower() == doc_no_ext.lower():
+                    return doc
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error finding document by partial name: {str(e)}")
+            return None
     
     async def summarize_document(self, filename: str) -> Dict[str, Any]:
         """
@@ -174,25 +225,79 @@ class ChatService:
         try:
             logger.info(f"Starting document summarization for: {filename}")
             
-            # Search for content from the specific document
+            # First, get list of available documents for debugging
+            available_docs = self.get_available_documents()
+            logger.info(f"Available documents: {available_docs}")
+            
+            # Try to find the document with flexible matching
+            matched_filename = self.find_document_by_partial_name(filename)
+            
+            if not matched_filename:
+                return {
+                    "success": False,
+                    "error": f"Document '{filename}' not found. Available documents: {available_docs}",
+                    "filename": filename,
+                    "summary": None,
+                    "metadata": {
+                        "available_documents": available_docs,
+                        "search_attempted": filename
+                    }
+                }
+            
+            logger.info(f"Found matching document: {matched_filename}")
+            
+            # Search for content from the matched document
             search_results = self.rag_system.collection.get(
-                where={"filename": filename}
+                where={"filename": matched_filename}
             )
             
             if not search_results or not search_results.get("documents"):
-                return {
-                    "success": False,
-                    "error": f"No content found for document: {filename}",
-                    "filename": filename,
-                    "summary": None,
-                    "metadata": None
-                }
+                # Try alternative search without where clause and filter manually
+                logger.warning(f"Direct search failed, trying alternative approach...")
+                all_results = self.rag_system.collection.get()
+                
+                if all_results and all_results.get("documents"):
+                    # Filter manually
+                    filtered_docs = []
+                    filtered_metas = []
+                    
+                    for doc, meta in zip(all_results["documents"], all_results.get("metadatas", [])):
+                        if meta and meta.get("filename") == matched_filename:
+                            filtered_docs.append(doc)
+                            filtered_metas.append(meta)
+                    
+                    if filtered_docs:
+                        search_results = {
+                            "documents": filtered_docs,
+                            "metadatas": filtered_metas
+                        }
+                        logger.info(f"Manual filtering found {len(filtered_docs)} chunks")
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"No content chunks found for document: {matched_filename}",
+                            "filename": filename,
+                            "summary": None,
+                            "metadata": {
+                                "matched_filename": matched_filename,
+                                "total_documents_in_collection": len(all_results.get("documents", [])),
+                                "available_documents": available_docs
+                            }
+                        }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"No documents found in RAG collection",
+                        "filename": filename,
+                        "summary": None,
+                        "metadata": None
+                    }
             
             # Extract documents and metadata
             documents = search_results["documents"]
             metadatas = search_results.get("metadatas", [])
             
-            logger.info(f"Found {len(documents)} chunks for document: {filename}")
+            logger.info(f"Found {len(documents)} chunks for document: {matched_filename}")
             
             # Combine all chunks from the document
             full_content = "\n\n".join(documents)
@@ -224,7 +329,7 @@ class ChatService:
             # Generate comprehensive summary
             summary_result = await self._generate_comprehensive_summary(
                 content_for_summary, 
-                filename, 
+                matched_filename, 
                 content_stats,
                 is_truncated
             )
@@ -235,6 +340,7 @@ class ChatService:
             return {
                 "success": True,
                 "filename": filename,
+                "matched_filename": matched_filename,
                 "summary": summary_result,
                 "metadata": {
                     "content_stats": content_stats,
@@ -252,7 +358,10 @@ class ChatService:
                 "error": f"Summary generation error: {str(e)}",
                 "filename": filename,
                 "summary": None,
-                "metadata": None
+                "metadata": {
+                    "error_details": str(e),
+                    "available_documents": self.get_available_documents()
+                }
             }
 
     async def _generate_comprehensive_summary(
@@ -585,7 +694,6 @@ Would you like me to try a different search approach or summarize the document t
             logger.error(f"Error clearing session {session_id}: {str(e)}")
             return {"error": f"Failed to clear session: {str(e)}"}
     
-    
     async def upload_document(self, content: bytes, filename: str, is_pdf: bool = False) -> Dict[str, Any]:
         """
     Upload and process a document
@@ -607,23 +715,132 @@ Would you like me to try a different search approach or summarize the document t
                 "success": False,
                 "error": "No content provided",
                 "filename": filename
-                }
+            }
         
-        # Return success with file info
+        # Initialize RAG system if not already done
+            if not hasattr(self, 'rag_system') or self.rag_system is None:
+              # Adjust import path as needed
+                self.rag_system = RAGSystem()
+        
+        # Process and add document to vector store
+            if is_pdf:
+            # Use the RAG system's add_pdf_document method
+                result = self.rag_system.add_pdf_document(content, filename)
+            else:
+            # For text files, decode content first
+                try:
+                    text_content = content.decode('utf-8')
+                except UnicodeDecodeError:
+                # Try other common encodings
+                    try:
+                        text_content = content.decode('latin-1')
+                    except:
+                        return {
+                        "success": False,
+                        "error": "Could not decode text file. Please ensure it's UTF-8 encoded.",
+                        "filename": filename
+                    }
+            
+            # Use the RAG system's add_document method
+            result = self.rag_system.add_document(text_content, filename)
+        
+            logger.info(f"Document processing result: {result}")
+        
+        # Return success with detailed info
             return {
             "success": True,
-            "message": f"Document '{filename}' received successfully",
+            "message": f"Document '{filename}' uploaded and processed successfully",
             "filename": filename,
             "file_size": len(content),
             "is_pdf": is_pdf,
+            "processing_result": result,
             "content_type": "application/pdf" if is_pdf else "text/plain"
-            }
+        }
         
         except Exception as e:
             logger.error(f"Document upload error for {filename}: {str(e)}")
-        return {
+            return {
             "success": False,
             "error": f"Upload failed: {str(e)}",
             "filename": filename
         }
     
+    
+    
+    
+    async def add_message_directly_to_history(self, session_id: str, message: str, role: str):
+        """
+        Add a message directly to session history without any AI processing
+        This is for storing summaries, assistant responses, etc.
+        """
+        try:
+            # Get existing session history
+            session_info = self.get_session_info(session_id)
+            if not session_info:
+                raise ValueError("Session not found")
+            
+            # Add message to history
+            message_entry = {
+                "role": role,
+                "message": message,  # Store exact content
+                "content": message,  # Also store as content field
+                "text": message,     # And as text field for compatibility
+                "timestamp": datetime.now().isoformat(),
+                "id": f"{session_id}_{int(time.time())}"
+            }
+            
+            # Add to your session storage (database, file, etc.)
+            # This depends on how you're storing sessions
+            # Example:
+            if hasattr(self, 'session_storage'):
+                self.session_storage[session_id]['messages'].append(message_entry)
+            
+            return {
+                "success": True,
+                "message_id": message_entry["id"],
+                "stored_content": message  # Return what was actually stored
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to add message directly to history: {str(e)}")
+            raise
+        
+        
+            # Add this method to your ChatService class
+
+    async def add_message_to_session(self, session_id: str, message: str, role: str = "user"):
+        """Add a message directly to session history without processing"""
+        try:
+        # Ensure session exists first - use your existing method
+            if not self.memory_manager.session_exists(session_id):
+                self.memory_manager.create_session_only(session_id)
+        
+        # Get the memory object using your existing method
+            memory = self.memory_manager.get_memory_object(session_id)
+        
+            if role.lower() in ["user", "human"]:
+                memory.chat_memory.add_user_message(message)
+            elif role.lower() in ["assistant", "ai"]:
+                memory.chat_memory.add_ai_message(message)
+            else:
+            # For other roles, add as user message with role prefix
+                memory.chat_memory.add_user_message(f"[{role}]: {message}")
+        
+        # Get message count using your existing get_chat_history method
+            history = self.memory_manager.get_chat_history(session_id)
+            message_count = len(history)
+        
+            logger.info(f"✅ Message added to session {session_id} using MemoryManager methods")
+            logger.info(f"📊 Total messages in session: {message_count}")
+        
+            return {
+            "success": True,
+            "message_stored": True,
+            "session_id": session_id,
+            "role": role,
+            "message_count": message_count
+        }
+        
+        except Exception as e:
+            logger.error(f"Error adding message to session {session_id}: {str(e)}")
+            raise e

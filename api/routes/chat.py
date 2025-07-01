@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
-from database.models.chat import ChatRequest, ChatResponse
+from database.models.chat import ChatRequest, ChatResponse,AddMessageRequest
 from services.chat_service import ChatService
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -28,6 +28,8 @@ class NewSessionRequest(BaseModel):
     initial_message: Optional[str] = None
     role: Optional[str] = "user"
     generate_response: bool = False
+
+
 
 # Dependency to get chat service
 async def get_chat_service() -> ChatService:
@@ -84,35 +86,7 @@ async def upload_document(
 
 # ALL OTHER ROUTES MOVED FROM main.py
 
-# Health check endpoint
-@router.get("/health")
-async def health_check():
-    """Health check endpoint to verify service status"""
-    try:
-        service_status = {
-            "chat_service": chat_service is not None
-        }
-        
-        # If chat service is available, get additional stats
-        if chat_service:
-            try:
-                stats = chat_service.get_system_stats()
-                service_status.update(stats)
-            except Exception as e:
-                logger.warning(f"Could not get service stats: {str(e)}")
-        
-        return {
-            "status": "healthy" if chat_service else "unhealthy",
-            "features": ["quiz_generation", "document_analysis", "chat"],
-            "services": service_status
-        }
-    except Exception as e:
-        logger.error(f"Health check error: {str(e)}")
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "services": {"chat_service": False}
-        }
+
 @router.post("/chat")
 async def chat_endpoint(
     request: ChatRequest,  # Changed from ChatRequestSimple to ChatRequest
@@ -277,7 +251,6 @@ async def create_new_session(
             "success": False,
             "error": f"Failed to create session: {str(e)}"
         }
-
 @router.post("/sessions/{session_id}/messages")
 async def add_message_to_session(
     session_id: str,
@@ -286,69 +259,58 @@ async def add_message_to_session(
 ):
     """Add a new message to an existing session"""
     try:
-        # Verify session exists
-        try:
-            session_info = chat_service.get_session_info(session_id)
-            if not session_info:
-                raise HTTPException(status_code=404, detail="Session not found")
-        except Exception:
-            raise HTTPException(status_code=404, detail="Session not found")
+        # Add message to session using the fixed method that uses MemoryManager
+        result = await chat_service.add_message_to_session(
+            session_id=session_id,
+            message=request.message,
+            role=request.role
+        )
         
+        # Base response data
         response_data = {
             "success": True,
             "session_id": session_id,
             "message": "Message added to session successfully",
             "role": request.role,
-            "message_content": request.message
+            "message_content": request.message,
+            "message_count": result.get("message_count", 0),
+            "message_stored": result.get("message_stored", True)
         }
         
-        # Add message to session
-        if hasattr(chat_service, 'add_message_to_session'):
-            # Use dedicated method if available
-            result = await chat_service.add_message_to_session(
-                session_id=session_id,
-                message=request.message,
-                role=request.role
-            )
-            response_data.update(result)
-            
-        elif request.role == "user":
-            # For user messages, use the chat processing (this will add to history)
-            if request.generate_response:
-                # Generate AI response
-                result = await chat_service.process_chat_message_simple(
+        # If user message and response requested, generate AI response
+        if request.role.lower() in ["user", "human"] and request.generate_response:
+            try:
+                logger.info(f"Generating AI response for session {session_id}")
+                ai_result = await chat_service.process_chat_message_simple(
                     message=request.message,
                     session_id=session_id,
                     use_rag=True
                 )
-                response_data["ai_response"] = result.get("response", "")
+                response_data["ai_response"] = ai_result.get("response", "")
                 response_data["response_generated"] = True
-            else:
-                # Just add the message without generating response
-                # This might need a custom method in your ChatService
-                result = await chat_service.process_chat_message_simple(
-                    message=request.message,
-                    session_id=session_id,
-                    use_rag=False
-                )
-                response_data["message_added"] = True
-        else:
-            # For assistant/system messages, we need a way to add them to history
-            # This would require a method in ChatService to add messages without processing
-            logger.warning(f"Cannot add {request.role} message without dedicated method")
-            response_data["warning"] = f"Adding {request.role} messages requires ChatService.add_message_to_session method"
+                response_data["ai_message_count"] = ai_result.get("message_count", 0)
+                
+                logger.info(f"✅ AI response generated for session {session_id}")
+                
+            except Exception as e:
+                logger.error(f"Error generating AI response for session {session_id}: {str(e)}")
+                response_data["ai_response_error"] = str(e)
+                response_data["response_generated"] = False
+        
+        logger.info(f"✅ Message added to session {session_id} - Total messages: {response_data['message_count']}")
         
         return response_data
         
-    except HTTPException:
-        raise
+    except ValueError as ve:
+        logger.error(f"Validation error for session {session_id}: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
+        
     except Exception as e:
-        logger.error(f"Add message to session error: {str(e)}")
-        return {
-            "success": False,
-            "error": f"Failed to add message to session: {str(e)}"
-        }
-
+        logger.error(f"Add message to session error for {session_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to add message to session: {str(e)}"
+        )
 @router.post("/sessions/{session_id}/messages/batch")
 async def add_multiple_messages_to_session(
     session_id: str,
@@ -489,12 +451,3 @@ async def clear_session(
             "error": f"Failed to clear session: {str(e)}"
         }
 
-# Additional endpoints for debugging
-@router.get("/debug/service-status")
-async def debug_service_status():
-    """Debug endpoint to check service initialization status"""
-    return {
-        "chat_service_instance": chat_service is not None,
-        "service_type": type(chat_service).__name__ if chat_service else None,
-        "available_methods": dir(chat_service) if chat_service else []
-    }

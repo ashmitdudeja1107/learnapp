@@ -1,0 +1,38 @@
+
+Machine Learning (ML) - Overview
+
+Machine Learning is a branch of Artificial Intelligence (AI) that focuses on building systems that can learn from data and improve over time without being explicitly programmed.
+
+Types of Machine Learning:
+1. Supervised Learning:
+   - Learns from labeled data (input-output pairs)
+   - Examples: Linear Regression, Decision Trees, Support Vector Machines
+
+2. Unsupervised Learning:
+   - Learns from unlabeled data (finds hidden patterns)
+   - Examples: K-Means Clustering, PCA, Hierarchical Clustering
+
+3. Reinforcement Learning:
+   - Learns by interacting with an environment and receiving rewards or penalties
+   - Examples: Q-Learning, Deep Q Networks
+
+Common Applications:
+- Image recognition
+- Natural Language Processing (NLP)
+- Predictive analytics
+- Recommendation systems
+- Fraud detection
+
+Popular ML Libraries:
+- Scikit-learn
+- TensorFlow
+- PyTorch
+- XGBoost
+
+Key Concepts:
+- Features and Labels
+- Training and Testing datasets
+- Overfitting and Underfitting
+- Evaluation Metrics (Accuracy, Precision, Recall, F1 Score)
+
+Machine Learning is a foundational technology behind modern AI applications.
