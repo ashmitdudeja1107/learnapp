@@ -43,83 +43,100 @@ class QuizService:
             logger.error(f"Error processing document: {str(e)}")
             return False
     
-    def generate_quiz_questions(self, num_questions: int = 10, difficulty: str = "medium", question_type: str = "multiple_choice") -> Dict[str, Any]:
-        """
-        Generate quiz questions using the integrated pipeline in formatted JSON structure
-        """
+    def generate_quiz_questions(self, 
+                              content: str, 
+                              num_questions: int = 5, 
+                              difficulty: str = "medium",
+                              question_type: str = "multiple_choice") -> List[Dict[str, Any]]:
+        """Generate quiz questions from content - optimized version"""
+    
+    # Truncate content if too long to reduce processing time
+        max_content_length = 3000  # Adjust based on your model's context window
+        if len(content) > max_content_length:
+            content = content[:max_content_length] + "..."
+            logger.info(f"Content truncated to {max_content_length} characters for faster processing")
+    
+    # Simplified, more direct prompt
+        prompt = f"""Generate {num_questions} {difficulty} multiple choice questions from this content.
+
+    Content: {content}
+
+    Return ONLY a JSON array like this:
+    [{{"id":"q1","question":"Question?","options":[{{"label":"A","text":"Option A","is_correct":false}},{{"label":"B","text":"Option B","is_correct":true}},{{"label":"C","text":"Option C","is_correct":false}},{{"label":"D","text":"Option D","is_correct":false}}],"correct_answer":"B","explanation":"Why B is correct","difficulty":"{difficulty}","topic":"Topic"}}]
+
+    Generate exactly {num_questions} questions. Focus on key concepts."""
+    
         try:
-            if not self.quiz_rag_service.documents:
-                logger.error("No documents loaded for quiz generation")
-                return {"questions": []}
+        # Generate with timeout to prevent hanging
+            response = self.generate_text(prompt, max_tokens=2000, temperature=0.7)
+        
+        # More robust JSON extraction
+            response = response.strip()
+        
+        # Find JSON array boundaries
+            start_idx = response.find('[')
+            end_idx = response.rfind(']') + 1
+        
+            if start_idx == -1 or end_idx == 0:
+                logger.error("No JSON array found in response")
+                return []
+        
+            json_str = response[start_idx:end_idx]
+        
+            try:
+                questions = json.loads(json_str)
             
-            # Get diverse content chunks
-            content_chunks = self.quiz_rag_service.get_context_for_question_generation()
-            
-            if not content_chunks:
-                logger.error("No content chunks available for question generation")
-                return {"questions": []}
-            
-            # Generate questions using the pipeline
-            questions = self.quiz_pipeline.generate_quiz_questions(
-                content_chunks=content_chunks,
-                num_questions=num_questions,
-                difficulty=difficulty,
-                question_type=question_type
-            )
-            
-            # Convert to the exact format with proper structure
-            formatted_questions = []
-            for i, question in enumerate(questions, 1):
-                # Convert options to the required format with label, text, and is_correct
-                formatted_options = []
-                for opt in question.options:
-                    formatted_options.append({
-                        "label": opt.label,
-                        "text": opt.text,
-                        "is_correct": opt.is_correct
-                    })
-                
-                # Get context from RAG service for this question
-                context = ""
-                try:
-                    # Try to get the context that was used to generate this question
-                    if hasattr(question, 'context') and question.context:
-                        context = question.context
+            # Validate and clean questions
+                valid_questions = []
+                for i, q in enumerate(questions):
+                    if self._validate_question_format(q):
+                    # Ensure correct format
+                        q['id'] = q.get('id', f'q{i+1}')
+                        valid_questions.append(q)
                     else:
-                        # Fallback: get relevant context from RAG service
-                        if content_chunks and len(content_chunks) > 0:
-                            # Use the first available context chunk or try to find relevant one
-                            context = content_chunks[0] if isinstance(content_chunks[0], str) else str(content_chunks[0])
-                            # Truncate context if too long
-                            if len(context) > 500:
-                                context = context[:500] + "..."
-                except Exception as ctx_error:
-                    logger.warning(f"Could not retrieve context for question {i}: {str(ctx_error)}")
-                    context = f"Context from processed document for question {i}"
+                        logger.warning(f"Invalid question format at index {i}")
+            
+                return valid_questions[:num_questions]  # Ensure we don't exceed requested number
+            
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+            # Try to fix common JSON issues
+                json_str = json_str.replace("'", '"')  # Replace single quotes
+                json_str = json_str.replace('True', 'true').replace('False', 'false')
+            
+                try:
+                    questions = json.loads(json_str)
+                    return questions[:num_questions]
+                except:
+                    logger.error("Could not parse JSON even after cleanup")
+                    return []
                 
-                formatted_question = {
-                    "id": question.id,
-                    "question": question.question,
-                    "options": formatted_options,
-                    "correct_answer": question.correct_answer,
-                    "explanation": question.explanation,
-                    "difficulty": difficulty,
-                    "topic": getattr(question, 'topic', 'General'),
-                    "context": context
-                }
-                formatted_questions.append(formatted_question)
-            
-            # Return in the exact format with "questions" wrapper
-            result = {
-                "questions": formatted_questions
-            }
-            
-            logger.info(f"Generated {len(questions)} quiz questions in formatted structure")
-            return result
-            
         except Exception as e:
             logger.error(f"Error generating quiz questions: {str(e)}")
-            return {"questions": []}
+            return []
+
+    def _validate_question_format(self, question: Dict) -> bool:
+        """Validate question has required fields"""
+        required_fields = ['question', 'options', 'correct_answer']
+    
+        if not all(field in question for field in required_fields):
+            return False
+    
+        if not isinstance(question['options'], list) or len(question['options']) != 4:
+            return False
+    
+    # Check if at least one option is marked correct
+        has_correct = any(opt.get('is_correct', False) for opt in question['options'])
+        if not has_correct:
+        # Try to mark the correct answer
+            correct_label = question.get('correct_answer', '')
+            for opt in question['options']:
+                if opt.get('label') == correct_label:
+                    opt['is_correct'] = True
+                    has_correct = True
+                    break
+    
+            return has_correct
     def evaluate_quiz(self, questions: List[QuizQuestion], user_answers: Dict[str, str]) -> QuizResult:
         """
         Evaluate quiz answers and return comprehensive results

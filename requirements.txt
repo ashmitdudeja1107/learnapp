@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+redis
+python-multipart
+langchain
+langchain_community
+langchain_core
+sentence-transformers
+PyPDF2
+chromadb
+faiss-cpu

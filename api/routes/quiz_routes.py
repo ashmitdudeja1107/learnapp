@@ -4,6 +4,12 @@ from pydantic import BaseModel
 import tempfile
 import os
 
+import hashlib
+import json
+
+from redis import Redis
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
+
 import logging
 from datetime import datetime, timedelta
 import tempfile
@@ -65,89 +71,113 @@ def clean_expired_sessions():
     ]
     for session_id in expired_sessions:
         del quiz_sessions[session_id]
+ 
 
-# ROUTE 1: Generate Quiz (Modified to include session)
+def is_redis_available():
+    """
+    Check if Redis is available and working
+    Returns: bool - True if Redis is working, False otherwise
+    """
+    try:
+        # Simple ping test
+        redis_client.ping()
+        return True
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis unavailable: {str(e)}")
+        return False
+    except Exception as e:
+        logger.warning(f"Unexpected Redis error: {str(e)}")
+        return False 
+ 
+def safe_redis_get(key):
+    """
+    Safely get value from Redis with fallback
+    Returns: cached value or None if Redis is unavailable
+    """
+    if not is_redis_available():
+        return None
+    
+    try:
+        return redis_client.get(key)
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis get failed for key {key}: {str(e)}")
+        return None
+
+def safe_redis_setex(key, time, value):
+    """
+    Safely set value in Redis with expiration, with fallback
+    Returns: bool - True if successful, False if failed
+    """
+    if not is_redis_available():
+        logger.info("Redis unavailable, skipping cache set")
+        return False
+    
+    try:
+        redis_client.setex(key, time, value)
+        return True
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis setex failed for key {key}: {str(e)}")
+        return False        
+        
+redis_client = Redis(host='localhost', port=6379, decode_responses=True)        
 @router.post("/generate")
 async def generate_quiz_from_uploaded_file(
     file: UploadFile = File(...),
     num_questions: int = Form(8),
     difficulty: str = Form("medium")
 ):
-    """
-    Generate quiz questions from uploaded document
-    Returns: {"session_id": "...", "questions": [...]}
-    """
     tmp_file_path = None
     try:
-        # Validate file type
         allowed_extensions = {'.pdf', '.txt', '.docx', '.doc'}
         file_extension = os.path.splitext(file.filename)[1].lower()
-        
+
         if file_extension not in allowed_extensions:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported file type. Allowed types: {', '.join(allowed_extensions)}"
-            )
-        
-        # Validate parameters
+            raise HTTPException(status_code=400, detail=f"Unsupported file type.")
+
         if num_questions < 1 or num_questions > 20:
-            raise HTTPException(
-                status_code=400,
-                detail="Number of questions must be between 1 and 20"
-            )
-        
+            raise HTTPException(status_code=400, detail="Invalid num_questions")
+
         if difficulty not in ["easy", "medium", "hard"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Difficulty must be one of: easy, medium, hard"
-            )
-        
-        # Read file content
+            raise HTTPException(status_code=400, detail="Invalid difficulty")
+
         content = await file.read()
         if not content:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            raise HTTPException(status_code=400, detail="File empty")
+
+        # Generate cache key using hash of file content + params
+        file_hash = hashlib.sha256(content).hexdigest()
+        cache_key = f"quiz:{file_hash}:{num_questions}:{difficulty}"
+
+        # Check Redis cache (with fallback if Redis is down)
+        cached_data = safe_redis_get(cache_key)
+        if cached_data:
+            logger.info(f"Cache hit for key: {cache_key}")
+            return json.loads(cached_data)
         
-        # Create temporary file
+        # Log if Redis check was skipped
+        if not is_redis_available():
+            logger.info("Redis unavailable, proceeding without cache")
+
+        # Store file temporarily
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
         tmp_file_path = tmp_file.name
-        
-        # Write content and close file properly
         tmp_file.write(content)
         tmp_file.flush()
         tmp_file.close()
-        
-        # Verify file was created successfully
-        if not os.path.exists(tmp_file_path) or os.path.getsize(tmp_file_path) == 0:
-            raise HTTPException(
-                status_code=500, 
-                detail="Failed to create temporary file"
-            )
-        
-        logger.info(f"Created temporary file: {tmp_file_path}, size: {os.path.getsize(tmp_file_path)}")
-        
-        # Process document
+
         documents = quiz_service.process_document_for_quiz(tmp_file_path)
         if not documents:
-            raise HTTPException(
-                status_code=422, 
-                detail="Could not process the uploaded document. Please ensure the file is readable and contains text content."
-            )
-        
-        # Generate quiz questions
+            raise HTTPException(status_code=422, detail="Document unreadable")
+
         quiz_response = quiz_service.generate_quiz_questions(
             num_questions=num_questions,
             difficulty=difficulty,
             question_type="multiple_choice"
         )
-        
-        # Validate that we have questions
+
         if not quiz_response.get('questions'):
-            raise HTTPException(
-                status_code=422, 
-                detail="Could not generate questions from the uploaded document. The document may not contain enough content for quiz generation."
-            )
-        
-        # Convert to QuizQuestion objects for storage
+            raise HTTPException(status_code=422, detail="Quiz generation failed")
+
         questions = []
         for q_data in quiz_response['questions']:
             question = QuizQuestion(
@@ -160,33 +190,37 @@ async def generate_quiz_from_uploaded_file(
                 topic=q_data.get('topic', 'General')
             )
             questions.append(question)
-        
-        # Store questions and get session ID
+
         session_id = store_quiz_session(questions)
-        
-        # Clean expired sessions
         clean_expired_sessions()
-        
-        # Return quiz with session ID
-        return {
+
+        response = {
             "session_id": session_id,
             "questions": quiz_response['questions']
         }
-        
+
+        # Try to cache the response in Redis (gracefully fail if Redis is down)
+        cache_success = safe_redis_setex(cache_key, 600, json.dumps(response))
+        if cache_success:
+            logger.info(f"Response cached successfully for key: {cache_key}")
+        else:
+            logger.info("Response not cached (Redis unavailable)")
+
+        return response
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error in generate_quiz: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating quiz: {str(e)}")
     finally:
-        # Clean up temporary file
         if tmp_file_path and os.path.exists(tmp_file_path):
             try:
                 os.unlink(tmp_file_path)
-                logger.info(f"Cleaned up temporary file: {tmp_file_path}")
+                logger.info(f"Deleted temp file: {tmp_file_path}")
             except Exception as cleanup_error:
-                logger.warning(f"Failed to clean up temporary file {tmp_file_path}: {str(cleanup_error)}")
-
+                logger.warning(f"Cleanup failed: {str(cleanup_error)}")
+                
 class QuizGenerationRequest(BaseModel):
     num_questions: int
     difficulty: str 
