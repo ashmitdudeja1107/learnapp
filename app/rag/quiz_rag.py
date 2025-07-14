@@ -1,24 +1,60 @@
 from typing import List, Dict, Any, Optional
 import os
-# Fixed imports to address deprecation warnings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.schema import Document
 import tempfile
 import logging
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
-class QuizRAGService:
-    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize Quiz RAG Service with embeddings
-        """
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=f"sentence-transformers/{embedding_model}"
+class TFIDFEmbeddings:
+    """
+    TF-IDF based embeddings implementation
+    """
+    def __init__(self, max_features: int = 5000, ngram_range: tuple = (1, 2)):
+        self.vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            stop_words='english',
+            ngram_range=ngram_range,
+            max_df=0.95,
+            min_df=2
         )
+        self.is_fitted = False
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of documents"""
+        if not self.is_fitted:
+            tfidf_matrix = self.vectorizer.fit_transform(texts)
+            self.is_fitted = True
+        else:
+            tfidf_matrix = self.vectorizer.transform(texts)
+        
+        # Convert sparse matrix to dense and then to list of lists
+        return tfidf_matrix.toarray().tolist()
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query"""
+        if not self.is_fitted:
+            raise ValueError("Embeddings not fitted yet. Call embed_documents first.")
+        
+        query_vector = self.vectorizer.transform([text])
+        return query_vector.toarray().tolist()[0]
+
+class QuizRAGService:
+    def __init__(self, max_features: int = 5000, ngram_range: tuple = (1, 2)):
+        """
+        Initialize Quiz RAG Service with TF-IDF embeddings
+        
+        Args:
+            max_features: Maximum number of features for TF-IDF
+            ngram_range: Range of n-grams for TF-IDF
+        """
+        self.embeddings = TFIDFEmbeddings(max_features=max_features, ngram_range=ngram_range)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,

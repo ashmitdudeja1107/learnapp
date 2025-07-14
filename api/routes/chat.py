@@ -6,6 +6,16 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import logging
 
+import tempfile
+import os
+
+import hashlib
+import json
+
+from redis import Redis
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -155,16 +165,89 @@ async def chat_endpoint_simple(
         logger.error(f"Simple chat endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
     
+ 
+redis_client = Redis(host='localhost', port=6379, decode_responses=True)  
+def is_redis_available():
+    """
+    Check if Redis is available and working
+    Returns: bool - True if Redis is working, False otherwise
+    """
+    try:
+        # Simple ping test
+        redis_client.ping()
+        return True
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis unavailable: {str(e)}")
+        return False
+    except Exception as e:
+        logger.warning(f"Unexpected Redis error: {str(e)}")
+        return False 
+ 
+def safe_redis_get(key):
+    """
+    Safely get value from Redis with fallback
+    Returns: cached value or None if Redis is unavailable
+    """
+    if not is_redis_available():
+        return None
     
-# Document summarization endpoint
+    try:
+        return redis_client.get(key)
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis get failed for key {key}: {str(e)}")
+        return None
+
+def safe_redis_setex(key, time, value):
+    """
+    Safely set value in Redis with expiration, with fallback
+    Returns: bool - True if successful, False if failed
+    """
+    if not is_redis_available():
+        logger.info("Redis unavailable, skipping cache set")
+        return False
+    
+    try:
+        redis_client.setex(key, time, value)
+        return True
+    except (ConnectionError, TimeoutError, RedisError) as e:
+        logger.warning(f"Redis setex failed for key {key}: {str(e)}")
+        return False        
+            
+    
+# Document summarization endpoint with Redis caching
 @router.post("/summarize-document")
 async def summarize_document_endpoint(
     filename: str = Form(...),
     chat_service: ChatService = Depends(get_chat_service)
 ):
-    """Summarize document using ChatService"""
+    """Summarize document using ChatService with Redis caching"""
     try:
+        # Generate cache key using hash of filename
+        cache_key = f"summary:{hashlib.sha256(filename.encode()).hexdigest()}"
+        
+        # Check Redis cache (with fallback if Redis is down)
+        cached_data = safe_redis_get(cache_key)
+        if cached_data:
+            logger.info(f"Cache hit for summary key: {cache_key}")
+            return json.loads(cached_data)
+        
+        # Log if Redis check was skipped
+        if not is_redis_available():
+            logger.info("Redis unavailable, proceeding without cache for document summary")
+        
+        # Generate document summary
         result = await chat_service.summarize_document(filename)
+        
+        # Only cache successful results
+        if result.get("success", False):
+            # Try to cache the response in Redis (gracefully fail if Redis is down)
+            # Cache for 30 minutes (1800 seconds) - adjust as needed
+            cache_success = safe_redis_setex(cache_key, 1800, json.dumps(result))
+            if cache_success:
+                logger.info(f"Summary cached successfully for key: {cache_key}")
+            else:
+                logger.info("Summary not cached (Redis unavailable)")
+        
         return result
         
     except Exception as e:
@@ -173,7 +256,6 @@ async def summarize_document_endpoint(
             "success": False,
             "error": f"Document summarization failed: {str(e)}"
         }
-
 # Explain concept endpoint
 @router.post("/explain-concept")
 async def explain_concept_endpoint(

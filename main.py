@@ -46,8 +46,7 @@ async def lifespan(app: FastAPI):
         logger.info("ChatService initialized successfully")
         
         # Test the service to make sure it's working
-        stats = chat_service_instance.get_system_stats()
-        logger.info(f"Chat service stats: {stats}")
+        
         
         logger.info("Application startup complete")
         yield

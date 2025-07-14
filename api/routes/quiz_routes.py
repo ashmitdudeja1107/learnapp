@@ -72,7 +72,7 @@ def clean_expired_sessions():
     for session_id in expired_sessions:
         del quiz_sessions[session_id]
  
-
+redis_client = Redis(host='localhost', port=6379, decode_responses=True)  
 def is_redis_available():
     """
     Check if Redis is available and working
@@ -119,7 +119,7 @@ def safe_redis_setex(key, time, value):
         logger.warning(f"Redis setex failed for key {key}: {str(e)}")
         return False        
         
-redis_client = Redis(host='localhost', port=6379, decode_responses=True)        
+      
 @router.post("/generate")
 async def generate_quiz_from_uploaded_file(
     file: UploadFile = File(...),

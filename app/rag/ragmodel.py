@@ -1,31 +1,64 @@
-# Updated RAG System with Better Document Matching and Summarization
 import chromadb
 import PyPDF2
-from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List, Dict, Tuple, Optional
 import uuid
 import io
 import re
 import logging
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import openai
+import os
 
 logger = logging.getLogger(__name__)
 
 class RAGSystem:
-    def __init__(self, collection_name: str = "ai_tutor_docs"):
+    def __init__(self, collection_name: str = "ai_tutor_docs", embedding_method: str = "tfidf"):
+        """
+        Initialize RAG system with different embedding options:
+        - 'tfidf': Use TF-IDF vectorization (no external dependencies)
+        - 'openai': Use OpenAI embeddings (requires API key)
+        - 'custom': Use custom embedding function
+        """
         # Initialize ChromaDB with new configuration
         self.client = chromadb.PersistentClient(path="./chroma_db")
+        
+        # Set embedding method
+        self.embedding_method = embedding_method
+        
+        # Initialize embedding components based on method
+        if embedding_method == "tfidf":
+            self.vectorizer = TfidfVectorizer(
+                max_features=5000,
+                stop_words='english',
+                ngram_range=(1, 2)
+            )
+            self.embedding_function = self._get_tfidf_embedding
+        elif embedding_method == "openai":
+            if not os.getenv("OPENAI_API_KEY"):
+                raise ValueError("OpenAI API key required for OpenAI embeddings")
+            self.openai_client = openai.OpenAI()
+            self.embedding_function = self._get_openai_embedding
+        elif embedding_method == "custom":
+            self.embedding_function = self._get_custom_embedding
+        else:
+            raise ValueError(f"Unknown embedding method: {embedding_method}")
+        
+        # Storage for documents (needed for TF-IDF)
+        self.document_store = []
+        self.fitted_vectorizer = False
         
         # Get or create collection
         try:
             self.collection = self.client.get_collection(collection_name)
             print(f"Loaded existing collection: {collection_name}")
+            # Load existing documents for TF-IDF
+            self._load_existing_documents()
         except:
             self.collection = self.client.create_collection(collection_name)
             print(f"Created new collection: {collection_name}")
-        
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         # Text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -36,7 +69,81 @@ class RAGSystem:
         
         # Print initial state
         doc_count = self.collection.count()
-        print(f"Collection initialized with {doc_count} documents")
+        print(f"Collection initialized with {doc_count} documents using {embedding_method} embeddings")
+    
+    def _load_existing_documents(self):
+        """Load existing documents from ChromaDB for TF-IDF refitting"""
+        try:
+            if self.embedding_method == "tfidf":
+                existing_docs = self.collection.get()
+                if existing_docs and existing_docs.get("documents"):
+                    self.document_store = existing_docs["documents"]
+                    if self.document_store:
+                        self.vectorizer.fit(self.document_store)
+                        self.fitted_vectorizer = True
+                        print(f"Loaded {len(self.document_store)} existing documents for TF-IDF")
+        except Exception as e:
+            print(f"Error loading existing documents: {e}")
+    
+    def _get_tfidf_embedding(self, texts: List[str]) -> List[List[float]]:
+        """Get TF-IDF embeddings for texts"""
+        if not self.fitted_vectorizer:
+            # Fit vectorizer on all documents
+            all_texts = self.document_store + texts
+            self.vectorizer.fit(all_texts)
+            self.fitted_vectorizer = True
+        
+        # Transform texts to embeddings
+        embeddings = self.vectorizer.transform(texts)
+        return embeddings.toarray().tolist()
+    
+    def _get_openai_embedding(self, texts: List[str]) -> List[List[float]]:
+        """Get OpenAI embeddings for texts"""
+        embeddings = []
+        for text in texts:
+            try:
+                response = self.openai_client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=text
+                )
+                embeddings.append(response.data[0].embedding)
+            except Exception as e:
+                print(f"Error getting OpenAI embedding: {e}")
+                # Fallback to zero vector
+                embeddings.append([0.0] * 1536)
+        return embeddings
+    
+    def _get_custom_embedding(self, texts: List[str]) -> List[List[float]]:
+        """Custom embedding function - simple word count based"""
+        embeddings = []
+        
+        # Create a simple vocabulary from common words
+        vocab = set()
+        for text in texts:
+            words = re.findall(r'\b\w+\b', text.lower())
+            vocab.update(words)
+        
+        vocab_list = sorted(list(vocab))[:1000]  # Limit vocabulary size
+        
+        for text in texts:
+            words = re.findall(r'\b\w+\b', text.lower())
+            word_counts = {}
+            for word in words:
+                word_counts[word] = word_counts.get(word, 0) + 1
+            
+            # Create embedding vector
+            embedding = []
+            for word in vocab_list:
+                embedding.append(word_counts.get(word, 0))
+            
+            # Normalize
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = [x / norm for x in embedding]
+            
+            embeddings.append(embedding)
+        
+        return embeddings
     
     def normalize_filename(self, filename: str) -> str:
         """Normalize filename for consistent storage and retrieval"""
@@ -81,8 +188,15 @@ class RAGSystem:
             if not chunks:
                 raise ValueError("No chunks created from document")
             
+            # Add chunks to document store for TF-IDF
+            if self.embedding_method == "tfidf":
+                self.document_store.extend(chunks)
+                # Refit vectorizer with new documents
+                self.vectorizer.fit(self.document_store)
+                self.fitted_vectorizer = True
+            
             # Generate embeddings
-            embeddings = self.embedding_model.encode(chunks).tolist()
+            embeddings = self.embedding_function(chunks)
             
             # Create unique IDs for chunks
             ids = [str(uuid.uuid4()) for _ in chunks]
@@ -93,7 +207,8 @@ class RAGSystem:
                     "filename": normalized_filename,
                     "original_filename": filename,  # Keep original for reference
                     "chunk_index": i,
-                    "total_chunks": len(chunks)
+                    "total_chunks": len(chunks),
+                    "embedding_method": self.embedding_method
                 } 
                 for i in range(len(chunks))
             ]
@@ -106,7 +221,7 @@ class RAGSystem:
                 ids=ids
             )
             
-            result = f"Added {len(chunks)} chunks from {normalized_filename}"
+            result = f"Added {len(chunks)} chunks from {normalized_filename} using {self.embedding_method} embeddings"
             print(result)
             print(f"Collection now has {self.collection.count()} total documents")
             return result
@@ -146,7 +261,8 @@ class RAGSystem:
                     documents[filename] = {
                         "filename": filename,
                         "original_filename": original_filename,
-                        "chunk_count": chunk_count
+                        "chunk_count": chunk_count,
+                        "embedding_method": metadata.get("embedding_method", "unknown")
                     }
             
             # Convert to list and sort
@@ -277,14 +393,14 @@ class RAGSystem:
                 print("No documents in collection to search")
                 return {"documents": [], "metadatas": [], "distances": []}
             
-            print(f"Enhanced search for: '{query}'")
+            print(f"Enhanced search for: '{query}' using {self.embedding_method} embeddings")
             
-            # Strategy 1: Direct semantic search
-            query_embedding = self.embedding_model.encode([query]).tolist()
+            # Generate query embedding
+            query_embedding = self.embedding_function([query])[0]
             actual_n_results = min(n_results, doc_count)
             
             results = self.collection.query(
-                query_embeddings=query_embedding,
+                query_embeddings=[query_embedding],
                 n_results=actual_n_results
             )
             
@@ -357,9 +473,9 @@ class RAGSystem:
             
             for alt_query in alternatives[:3]:
                 try:
-                    alt_embedding = self.embedding_model.encode([alt_query]).tolist()
+                    alt_embedding = self.embedding_function([alt_query])[0]
                     alt_results = self.collection.query(
-                        query_embeddings=alt_embedding,
+                        query_embeddings=[alt_embedding],
                         n_results=5
                     )
                     
@@ -450,6 +566,7 @@ class RAGSystem:
         """Debug method to get information about the collection"""
         try:
             print(f"\n=== COLLECTION DEBUG INFO ===")
+            print(f"Embedding method: {self.embedding_method}")
             
             doc_count = self.collection.count()
             print(f"Total documents in collection: {doc_count}")
@@ -475,13 +592,14 @@ class RAGSystem:
                     if filename not in file_samples:
                         file_samples[filename] = {
                             'chunk_count': 0,
-                            'sample_content': doc[:300] + "..." if len(doc) > 300 else doc
+                            'sample_content': doc[:300] + "..." if len(doc) > 300 else doc,
+                            'embedding_method': meta.get('embedding_method', 'unknown')
                         }
                     file_samples[filename]['chunk_count'] += 1
             
             print(f"\nFile details:")
             for filename, info in file_samples.items():
-                print(f"  {filename}: {info['chunk_count']} chunks")
+                print(f"  {filename}: {info['chunk_count']} chunks ({info['embedding_method']} embeddings)")
                 print(f"    Sample: {info['sample_content'][:100]}...")
                 print()
             
@@ -489,7 +607,8 @@ class RAGSystem:
                 "total_docs": doc_count,
                 "files": list(filenames),
                 "file_details": file_samples,
-                "sample_content": [doc[:200] for doc in all_docs.get('documents', [])[:3]]
+                "sample_content": [doc[:200] for doc in all_docs.get('documents', [])[:3]],
+                "embedding_method": self.embedding_method
             }
             
         except Exception as e:
