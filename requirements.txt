@@ -6,7 +6,7 @@ langchain_community==0.3.27
 langchain_core==0.3.68
 langchain_ollama==0.3.4
 langchain_openai==0.3.28
-numpy==1.26.4
+numpy
 openai==1.95.1
 pydantic==2.11.7
 PyPDF2==3.0.1
