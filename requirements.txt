@@ -15,6 +15,6 @@ pydantic==2.11.7
 redis==6.2.0
 numpy
 scikit_learn
-
+pypdf
 PyPDF2==3.0.1
 python-multipart
