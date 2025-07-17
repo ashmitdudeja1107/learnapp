@@ -705,27 +705,26 @@ Would you like me to try a different search approach or summarize the document t
         
     Returns:
         Dict containing upload results
-        """
+       """
         try:
             logger.info(f"Received document upload: {filename}")
-        
+    
         # Validate input
             if not content:
                 return {
                 "success": False,
                 "error": "No content provided",
                 "filename": filename
-            }
-        
+                }
+    
         # Initialize RAG system if not already done
             if not hasattr(self, 'rag_system') or self.rag_system is None:
-              # Adjust import path as needed
                 self.rag_system = RAGSystem()
-        
+    
         # Process and add document to vector store
             if is_pdf:
             # Use the RAG system's add_pdf_document method
-                result = self.rag_system.add_pdf_document(content, filename)
+               result = self.rag_system.add_pdf_document(content, filename)
             else:
             # For text files, decode content first
                 try:
@@ -739,13 +738,13 @@ Would you like me to try a different search approach or summarize the document t
                         "success": False,
                         "error": "Could not decode text file. Please ensure it's UTF-8 encoded.",
                         "filename": filename
-                    }
+                        }
             
             # Use the RAG system's add_document method
-            result = self.rag_system.add_document(text_content, filename)
+                result = self.rag_system.add_document(text_content, filename)
         
             logger.info(f"Document processing result: {result}")
-        
+    
         # Return success with detailed info
             return {
             "success": True,
@@ -755,16 +754,15 @@ Would you like me to try a different search approach or summarize the document t
             "is_pdf": is_pdf,
             "processing_result": result,
             "content_type": "application/pdf" if is_pdf else "text/plain"
-        }
+            }
         
         except Exception as e:
             logger.error(f"Document upload error for {filename}: {str(e)}")
             return {
             "success": False,
             "error": f"Upload failed: {str(e)}",
-            "filename": filename
-        }
-    
+              "filename": filename
+            }
     
     
     

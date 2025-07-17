@@ -166,7 +166,7 @@ async def chat_endpoint_simple(
         raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
     
  
-redis_client = Redis(host='localhost', port=6379, decode_responses=True)  
+redis_client = Redis(host='redis', port=6379, decode_responses=True)  
 def is_redis_available():
     """
     Check if Redis is available and working

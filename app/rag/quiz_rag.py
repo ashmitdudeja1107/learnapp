@@ -4,6 +4,7 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader, Unstru
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
+from langchain.embeddings.base import Embeddings
 import tempfile
 import logging
 import numpy as np
@@ -12,11 +13,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
-class TFIDFEmbeddings:
+class TFIDFEmbeddings(Embeddings):
     """
     TF-IDF based embeddings implementation
     """
     def __init__(self, max_features: int = 5000, ngram_range: tuple = (1, 2)):
+        super().__init__()
         self.vectorizer = TfidfVectorizer(
             max_features=max_features,
             stop_words='english',

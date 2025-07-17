@@ -72,7 +72,7 @@ def clean_expired_sessions():
     for session_id in expired_sessions:
         del quiz_sessions[session_id]
  
-redis_client = Redis(host='localhost', port=6379, decode_responses=True)  
+redis_client = Redis(host='redis', port=6379, decode_responses=True)  
 def is_redis_available():
     """
     Check if Redis is available and working

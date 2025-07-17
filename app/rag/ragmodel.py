@@ -11,22 +11,29 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import openai
 import os
+import shutil
 
 logger = logging.getLogger(__name__)
 
 class RAGSystem:
-    def __init__(self, collection_name: str = "ai_tutor_docs", embedding_method: str = "tfidf"):
+    def __init__(self, collection_name: str = "ai_tutor_docs", embedding_method: str = "tfidf", reset_collection: bool = False):
         """
         Initialize RAG system with different embedding options:
         - 'tfidf': Use TF-IDF vectorization (no external dependencies)
         - 'openai': Use OpenAI embeddings (requires API key)
         - 'custom': Use custom embedding function
+        
+        Args:
+            collection_name: Name of the ChromaDB collection
+            embedding_method: Method for generating embeddings
+            reset_collection: If True, delete and recreate the collection
         """
         # Initialize ChromaDB with new configuration
         self.client = chromadb.PersistentClient(path="./chroma_db")
         
         # Set embedding method
         self.embedding_method = embedding_method
+        self.collection_name = collection_name
         
         # Initialize embedding components based on method
         if embedding_method == "tfidf":
@@ -50,15 +57,8 @@ class RAGSystem:
         self.document_store = []
         self.fitted_vectorizer = False
         
-        # Get or create collection
-        try:
-            self.collection = self.client.get_collection(collection_name)
-            print(f"Loaded existing collection: {collection_name}")
-            # Load existing documents for TF-IDF
-            self._load_existing_documents()
-        except:
-            self.collection = self.client.create_collection(collection_name)
-            print(f"Created new collection: {collection_name}")
+        # Handle collection creation/loading with dimension compatibility
+        self.collection = self._initialize_collection(reset_collection)
         
         # Text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -70,6 +70,74 @@ class RAGSystem:
         # Print initial state
         doc_count = self.collection.count()
         print(f"Collection initialized with {doc_count} documents using {embedding_method} embeddings")
+    
+    def _initialize_collection(self, reset_collection: bool):
+        """Initialize collection with proper dimension handling"""
+        try:
+            # If reset is requested, delete existing collection
+            if reset_collection:
+                try:
+                    self.client.delete_collection(self.collection_name)
+                    print(f"Deleted existing collection: {self.collection_name}")
+                except:
+                    pass  # Collection might not exist
+            
+            # Try to get existing collection
+            try:
+                collection = self.client.get_collection(self.collection_name)
+                print(f"Loaded existing collection: {self.collection_name}")
+                
+                # Check if collection is compatible with current embedding method
+                if not self._is_collection_compatible(collection):
+                    print(f"Collection dimension incompatible with {self.embedding_method} embeddings")
+                    print("Creating new collection with compatible dimensions...")
+                    
+                    # Delete and recreate collection
+                    self.client.delete_collection(self.collection_name)
+                    collection = self.client.create_collection(self.collection_name)
+                    print(f"Created new collection: {self.collection_name}")
+                else:
+                    # Load existing documents for TF-IDF
+                    self._load_existing_documents()
+                
+                return collection
+                
+            except Exception as e:
+                print(f"Creating new collection: {self.collection_name}")
+                return self.client.create_collection(self.collection_name)
+                
+        except Exception as e:
+            print(f"Error initializing collection: {e}")
+            raise
+    
+    def _is_collection_compatible(self, collection) -> bool:
+        """Check if existing collection is compatible with current embedding method"""
+        try:
+            # Get existing documents to check embedding dimension
+            existing_docs = collection.get(limit=1)
+            
+            if not existing_docs or not existing_docs.get("documents"):
+                return True  # Empty collection is compatible
+            
+            # Generate a test embedding to check dimension
+            test_embedding = self.embedding_function(["test"])
+            test_dimension = len(test_embedding[0])
+            
+            # Try to query with test embedding to see if dimensions match
+            try:
+                collection.query(
+                    query_embeddings=[test_embedding[0]],
+                    n_results=1
+                )
+                return True  # Query succeeded, dimensions are compatible
+            except Exception as e:
+                if "dimension" in str(e).lower():
+                    return False  # Dimension mismatch
+                return True  # Other error, assume compatible
+                
+        except Exception as e:
+            print(f"Error checking collection compatibility: {e}")
+            return False
     
     def _load_existing_documents(self):
         """Load existing documents from ChromaDB for TF-IDF refitting"""
@@ -114,7 +182,10 @@ class RAGSystem:
         return embeddings
     
     def _get_custom_embedding(self, texts: List[str]) -> List[List[float]]:
-        """Custom embedding function - simple word count based"""
+        """Custom embedding function - simple word count based with fixed dimension"""
+        # Fixed dimension for consistency
+        EMBEDDING_DIM = 384
+        
         embeddings = []
         
         # Create a simple vocabulary from common words
@@ -123,7 +194,8 @@ class RAGSystem:
             words = re.findall(r'\b\w+\b', text.lower())
             vocab.update(words)
         
-        vocab_list = sorted(list(vocab))[:1000]  # Limit vocabulary size
+        # Limit vocabulary size to ensure consistent dimension
+        vocab_list = sorted(list(vocab))[:EMBEDDING_DIM]
         
         for text in texts:
             words = re.findall(r'\b\w+\b', text.lower())
@@ -131,10 +203,15 @@ class RAGSystem:
             for word in words:
                 word_counts[word] = word_counts.get(word, 0) + 1
             
-            # Create embedding vector
+            # Create embedding vector with fixed dimension
             embedding = []
             for word in vocab_list:
                 embedding.append(word_counts.get(word, 0))
+            
+            # Pad or truncate to fixed dimension
+            while len(embedding) < EMBEDDING_DIM:
+                embedding.append(0.0)
+            embedding = embedding[:EMBEDDING_DIM]
             
             # Normalize
             norm = np.linalg.norm(embedding)
@@ -144,6 +221,26 @@ class RAGSystem:
             embeddings.append(embedding)
         
         return embeddings
+    
+    def reset_collection(self):
+        """Reset the collection (delete and recreate)"""
+        try:
+            self.client.delete_collection(self.collection_name)
+            print(f"Deleted collection: {self.collection_name}")
+            
+            self.collection = self.client.create_collection(self.collection_name)
+            print(f"Created new collection: {self.collection_name}")
+            
+            # Reset document store for TF-IDF
+            self.document_store = []
+            self.fitted_vectorizer = False
+            
+            return f"Collection {self.collection_name} has been reset"
+            
+        except Exception as e:
+            error_msg = f"Error resetting collection: {str(e)}"
+            print(error_msg)
+            raise Exception(error_msg)
     
     def normalize_filename(self, filename: str) -> str:
         """Normalize filename for consistent storage and retrieval"""
@@ -198,6 +295,11 @@ class RAGSystem:
             # Generate embeddings
             embeddings = self.embedding_function(chunks)
             
+            # Verify embedding dimensions
+            if embeddings:
+                embedding_dim = len(embeddings[0])
+                print(f"Generated embeddings with dimension: {embedding_dim}")
+            
             # Create unique IDs for chunks
             ids = [str(uuid.uuid4()) for _ in chunks]
             
@@ -208,7 +310,8 @@ class RAGSystem:
                     "original_filename": filename,  # Keep original for reference
                     "chunk_index": i,
                     "total_chunks": len(chunks),
-                    "embedding_method": self.embedding_method
+                    "embedding_method": self.embedding_method,
+                    "embedding_dimension": len(embeddings[0]) if embeddings else 0
                 } 
                 for i in range(len(chunks))
             ]
@@ -243,6 +346,12 @@ class RAGSystem:
             print(error_msg)
             raise Exception(error_msg)
     
+    # ... (rest of the methods remain the same as in the original code)
+    # Including: get_available_documents, find_document_by_name, get_document_content,
+    # search_similar_enhanced, extract_key_terms, generate_alternative_queries,
+    # combine_search_results, rerank_by_keywords, search_similar,
+    # get_context_for_query, debug_collection_info
+    
     def get_available_documents(self) -> List[Dict[str, str]]:
         """Get list of all available documents with both normalized and original filenames"""
         try:
@@ -262,7 +371,8 @@ class RAGSystem:
                         "filename": filename,
                         "original_filename": original_filename,
                         "chunk_count": chunk_count,
-                        "embedding_method": metadata.get("embedding_method", "unknown")
+                        "embedding_method": metadata.get("embedding_method", "unknown"),
+                        "embedding_dimension": metadata.get("embedding_dimension", "unknown")
                     }
             
             # Convert to list and sort
@@ -593,13 +703,14 @@ class RAGSystem:
                         file_samples[filename] = {
                             'chunk_count': 0,
                             'sample_content': doc[:300] + "..." if len(doc) > 300 else doc,
-                            'embedding_method': meta.get('embedding_method', 'unknown')
+                            'embedding_method': meta.get('embedding_method', 'unknown'),
+                            'embedding_dimension': meta.get('embedding_dimension', 'unknown')
                         }
                     file_samples[filename]['chunk_count'] += 1
             
             print(f"\nFile details:")
             for filename, info in file_samples.items():
-                print(f"  {filename}: {info['chunk_count']} chunks ({info['embedding_method']} embeddings)")
+                print(f"  {filename}: {info['chunk_count']} chunks ({info['embedding_method']} embeddings, dim: {info['embedding_dimension']})")
                 print(f"    Sample: {info['sample_content'][:100]}...")
                 print()
             
