@@ -4,6 +4,9 @@ from redis import Redis
 from redis.exceptions import ConnectionError, TimeoutError, RedisError
 from typing import Optional
 from datetime import datetime, timedelta  # Fixed import
+from dotenv import load_dotenv
+load_dotenv()
+
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +15,10 @@ class RedisConfig:
     
     def __init__(self):
         # Redis connection parameters from your Valkey dashboard
-        self.host = os.getenv('REDIS_HOST', 'valkey-291ddeb5-ashmit-650b.f.aivencloud.com')
-        self.port = int(os.getenv('REDIS_PORT', '19758'))
+        self.host = os.getenv('REDIS_HOST' )
+        self.port = int(os.getenv('REDIS_PORT'))
         self.username = os.getenv('REDIS_USERNAME', 'default')
-        self.password = os.getenv('REDIS_PASSWORD', 'AVNS_SoEtTDbyYLt9D7h143i')  # Replace with actual password
+        self.password = os.getenv('REDIS_PASSWORD')  # Replace with actual password
         self.decode_responses = True
         self.socket_timeout = 5
         self.socket_connect_timeout = 5
