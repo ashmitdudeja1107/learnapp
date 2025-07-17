@@ -15,29 +15,75 @@ logger = logging.getLogger(__name__)
 
 class TFIDFEmbeddings(Embeddings):
     """
-    TF-IDF based embeddings implementation
+    TF-IDF based embeddings implementation with adaptive parameters
     """
     def __init__(self, max_features: int = 5000, ngram_range: tuple = (1, 2)):
         super().__init__()
+        self.max_features = max_features
+        self.ngram_range = ngram_range
+        self.vectorizer = None
+        self.is_fitted = False
+    
+    def _create_vectorizer(self, num_documents: int):
+        """Create vectorizer with adaptive parameters based on document count"""
+        # Adaptive parameters based on document count
+        if num_documents < 5:
+            # Very few documents - use minimal constraints
+            min_df = 1
+            max_df = 1.0
+            max_features = min(1000, self.max_features)
+        elif num_documents < 20:
+            # Small collection - relax constraints
+            min_df = 1
+            max_df = 0.9
+            max_features = min(2000, self.max_features)
+        else:
+            # Larger collection - use original constraints
+            min_df = 2
+            max_df = 0.95
+            max_features = self.max_features
+        
         self.vectorizer = TfidfVectorizer(
             max_features=max_features,
             stop_words='english',
-            ngram_range=ngram_range,
-            max_df=0.95,
-            min_df=2
+            ngram_range=self.ngram_range,
+            max_df=max_df,
+            min_df=min_df
         )
-        self.is_fitted = False
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed a list of documents"""
-        if not self.is_fitted:
+        if not texts:
+            return []
+        
+        # Create vectorizer with adaptive parameters
+        self._create_vectorizer(len(texts))
+        
+        try:
+            if not self.is_fitted:
+                tfidf_matrix = self.vectorizer.fit_transform(texts)
+                self.is_fitted = True
+            else:
+                tfidf_matrix = self.vectorizer.transform(texts)
+            
+            # Convert sparse matrix to dense and then to list of lists
+            return tfidf_matrix.toarray().tolist()
+        
+        except ValueError as e:
+            # Fallback: create a simple vectorizer with minimal constraints
+            logger.warning(f"TF-IDF vectorizer failed with error: {e}. Using fallback vectorizer.")
+            
+            self.vectorizer = TfidfVectorizer(
+                max_features=min(1000, self.max_features),
+                stop_words='english',
+                ngram_range=(1, 1),  # Only unigrams
+                max_df=1.0,
+                min_df=1
+            )
+            
             tfidf_matrix = self.vectorizer.fit_transform(texts)
             self.is_fitted = True
-        else:
-            tfidf_matrix = self.vectorizer.transform(texts)
-        
-        # Convert sparse matrix to dense and then to list of lists
-        return tfidf_matrix.toarray().tolist()
+            return tfidf_matrix.toarray().tolist()
     
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query"""
@@ -123,11 +169,10 @@ class QuizRAGService:
         except Exception as e:
             logger.error(f"Error processing documents: {str(e)}")
             return []
-
     
     def create_vector_store(self, documents: List[Document]) -> bool:
         """
-        Create vector store from processed documents
+        Create vector store from processed documents with better error handling
         """
         try:
             if not documents:
@@ -143,7 +188,8 @@ class QuizRAGService:
             valid_documents = []
             for doc in documents:
                 if isinstance(doc, Document):
-                    valid_documents.append(doc)
+                    if len(doc.page_content.strip()) > 10:  # Ensure meaningful content
+                        valid_documents.append(doc)
                 else:
                     logger.warning(f"Skipping invalid document type: {type(doc)}")
             
@@ -151,15 +197,37 @@ class QuizRAGService:
                 logger.error("No valid documents found for vector store creation")
                 return False
             
+            # Check if we have enough content for meaningful embeddings
+            if len(valid_documents) < 2:
+                logger.warning(f"Only {len(valid_documents)} document(s) available. This may affect embedding quality.")
+            
             # Create FAISS vector store
-            self.vector_store = FAISS.from_documents(
-                documents=valid_documents,
-                embedding=self.embeddings
-            )
-            
-            logger.info(f"Created vector store with {len(valid_documents)} documents")
-            return True
-            
+            try:
+                self.vector_store = FAISS.from_documents(
+                    documents=valid_documents,
+                    embedding=self.embeddings
+                )
+                
+                logger.info(f"Created vector store with {len(valid_documents)} documents")
+                return True
+                
+            except Exception as embedding_error:
+                logger.error(f"Error in embedding creation: {str(embedding_error)}")
+                
+                # Try with a simpler embedding approach if needed
+                logger.info("Attempting to recreate embeddings with simpler parameters...")
+                
+                # Reinitialize with simpler parameters
+                self.embeddings = TFIDFEmbeddings(max_features=500, ngram_range=(1, 1))
+                
+                self.vector_store = FAISS.from_documents(
+                    documents=valid_documents,
+                    embedding=self.embeddings
+                )
+                
+                logger.info(f"Successfully created vector store with fallback embeddings")
+                return True
+                
         except Exception as e:
             logger.error(f"Error creating vector store: {str(e)}")
             return False
@@ -303,10 +371,148 @@ class QuizRAGService:
             logger.error(f"Error getting content chunks for quiz: {str(e)}")
             return []
     
+    def search_documents_by_keywords(self, keywords: List[str], max_results: int = 5) -> List[Document]:
+        """
+        Search documents by keywords without using vector store
+        """
+        try:
+            if not self.documents or not keywords:
+                return []
+            
+            matching_docs = []
+            keywords_lower = [kw.lower() for kw in keywords]
+            
+            for doc in self.documents:
+                content_lower = doc.page_content.lower()
+                score = sum(1 for kw in keywords_lower if kw in content_lower)
+                
+                if score > 0:
+                    matching_docs.append((doc, score))
+            
+            # Sort by score (descending) and return top results
+            matching_docs.sort(key=lambda x: x[1], reverse=True)
+            return [doc for doc, _ in matching_docs[:max_results]]
+            
+        except Exception as e:
+            logger.error(f"Error searching documents by keywords: {str(e)}")
+            return []
+    
+    def get_document_statistics(self) -> Dict[str, Any]:
+        """
+        Get detailed statistics about the loaded documents
+        """
+        try:
+            if not self.documents:
+                return {"message": "No documents loaded"}
+            
+            word_counts = []
+            char_counts = []
+            
+            for doc in self.documents:
+                content = doc.page_content
+                word_count = len(content.split())
+                char_count = len(content)
+                
+                word_counts.append(word_count)
+                char_counts.append(char_count)
+            
+            return {
+                "total_documents": len(self.documents),
+                "total_words": sum(word_counts),
+                "total_characters": sum(char_counts),
+                "average_words_per_chunk": sum(word_counts) / len(word_counts) if word_counts else 0,
+                "average_chars_per_chunk": sum(char_counts) / len(char_counts) if char_counts else 0,
+                "min_words": min(word_counts) if word_counts else 0,
+                "max_words": max(word_counts) if word_counts else 0,
+                "vector_store_ready": self.vector_store is not None,
+                "embeddings_fitted": self.embeddings.is_fitted if hasattr(self.embeddings, 'is_fitted') else False
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting document statistics: {str(e)}")
+            return {"error": str(e)}
+    
+    def reinitialize_embeddings(self, max_features: int = 1000, ngram_range: tuple = (1, 1)) -> bool:
+        """
+        Reinitialize embeddings with different parameters (useful for troubleshooting)
+        """
+        try:
+            logger.info(f"Reinitializing embeddings with max_features={max_features}, ngram_range={ngram_range}")
+            
+            # Create new embeddings instance
+            self.embeddings = TFIDFEmbeddings(max_features=max_features, ngram_range=ngram_range)
+            
+            # Recreate vector store if documents are available
+            if self.documents:
+                success = self.create_vector_store(self.documents)
+                if success:
+                    logger.info("Successfully reinitialized embeddings and vector store")
+                    return True
+                else:
+                    logger.error("Failed to recreate vector store with new embeddings")
+                    return False
+            else:
+                logger.info("Embeddings reinitialized, but no documents available for vector store")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error reinitializing embeddings: {str(e)}")
+            return False
+    
     def cleanup(self):
         """
         Clean up resources
         """
         self.vector_store = None
         self.documents = []
+        self.embeddings = TFIDFEmbeddings()
         logger.info("Quiz RAG resources cleaned up")
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    
+    # Initialize service
+    quiz_rag = QuizRAGService()
+    
+    # Example usage
+    file_path = "path/to/your/document.pdf"
+    
+    # Setup the RAG system
+    success = quiz_rag.setup_quiz_rag(file_path)
+    
+    if success:
+        print("Quiz RAG system initialized successfully!")
+        
+        # Get document summary
+        summary = quiz_rag.get_document_summary()
+        print(f"Document summary: {summary}")
+        
+        # Get statistics
+        stats = quiz_rag.get_document_statistics()
+        print(f"Document statistics: {stats}")
+        
+        # Get content chunks for quiz generation
+        chunks = quiz_rag.get_content_chunks_for_quiz(3)
+        print(f"Retrieved {len(chunks)} content chunks")
+        
+        # Search for specific content
+        if quiz_rag.vector_store:
+            relevant_docs = quiz_rag.retrieve_relevant_chunks("your search query", k=2)
+            print(f"Found {len(relevant_docs)} relevant documents")
+    
+    else:
+        print("Failed to initialize Quiz RAG system")
+        
+        # Try with simpler parameters
+        print("Attempting with simpler embedding parameters...")
+        success = quiz_rag.reinitialize_embeddings(max_features=500, ngram_range=(1, 1))
+        
+        if success:
+            print("Successfully reinitialized with simpler parameters")
+        else:
+            print("Failed to initialize even with simpler parameters")
+    
+    # Cleanup
+    quiz_rag.cleanup()
