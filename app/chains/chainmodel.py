@@ -1,12 +1,23 @@
 from langchain.chains import ConversationChain
 from langchain.prompts import PromptTemplate
-from langchain_ollama import OllamaLLM
 from typing import Dict, List
+import json
+import logging
+
+# Import your LLM service
+from services.llm_service import create_llm_service, LLMService  # Adjust import path as needed
+
+logger = logging.getLogger(__name__)
 
 class TutorChains:
-    def __init__(self, model_name: str = "llama3"):
-        # Initialize Ollama with Llama 3
-        self.llm = OllamaLLM (model=model_name)
+    def __init__(self, model_name: str = "llama3-8b-8192"):
+        # Initialize with Groq LLM service using the same model as LLMService
+        self.llm_service = create_llm_service(
+            provider="groq",
+            model_name=model_name,
+            temperature=0.7,
+            max_tokens=2000
+        )
         
         # AI Tutor prompt template
         self.tutor_prompt = PromptTemplate(
@@ -81,8 +92,12 @@ Summary:"""
             question=question
         )
         
-        response = self.llm.invoke(prompt)
-        return response
+        try:
+            response = self.llm_service.generate_text(prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Error generating tutor response: {str(e)}")
+            return "I apologize, but I encountered an error while processing your question. Please try again."
     
     def generate_quiz(self, topic: str, context: str = "") -> str:
         """Generate a quiz based on topic and context"""
@@ -91,23 +106,31 @@ Summary:"""
             context=context
         )
         
-        response = self.llm.invoke(prompt)
-        return response
+        try:
+            response = self.llm_service.generate_text(prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Error generating quiz: {str(e)}")
+            return json.dumps({"error": "Failed to generate quiz", "details": str(e)})
     
     def summarize_content(self, context: str) -> str:
         """Summarize given content"""
         prompt = self.summary_prompt.format(context=context)
         
-        response = self.llm.invoke(prompt)
-        return response
+        try:
+            response = self.llm_service.generate_text(prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Error summarizing content: {str(e)}")
+            return "I apologize, but I encountered an error while summarizing the content. Please try again."
     
     def explain_concept(self, concept: str, context: str = "", sources: List[str] = None) -> str:
-      """
-       Explain a specific concept using RAG context when available
-      """
-      if context and context.strip():
-           # We have relevant context from uploaded documents
-          explanation_prompt = f"""You are an AI tutor. Explain the concept of "{concept}" using the provided context from uploaded documents.
+        """
+        Explain a specific concept using RAG context when available
+        """
+        if context and context.strip():
+            # We have relevant context from uploaded documents
+            explanation_prompt = f"""You are an AI tutor. Explain the concept of "{concept}" using the provided context from uploaded documents.
 
 CONTEXT FROM UPLOADED DOCUMENTS:
 {context}
@@ -124,9 +147,9 @@ Based on the context above, please provide:
 Important: Base your explanation primarily on the provided context. If the context doesn't fully cover the concept, mention what information is available from the documents and supplement with general knowledge where needed.
 
 Explanation:"""
-      else:
-        # No context available - fall back to general explanation
-        explanation_prompt = f"""You are an AI tutor. Explain the concept of "{concept}" in a clear, educational way.
+        else:
+            # No context available - fall back to general explanation
+            explanation_prompt = f"""You are an AI tutor. Explain the concept of "{concept}" in a clear, educational way.
 
 Note: No specific context from uploaded documents is available for this concept.
 
@@ -138,6 +161,10 @@ Please provide:
 5. Common misconceptions (if any)
 
 Explanation:"""
-    
-      response = self.llm.invoke(explanation_prompt)
-      return response
+        
+        try:
+            response = self.llm_service.generate_text(explanation_prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Error explaining concept: {str(e)}")
+            return f"I apologize, but I encountered an error while explaining the concept '{concept}'. Please try again."

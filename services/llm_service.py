@@ -15,6 +15,7 @@ class LLMProvider(str, Enum):
     ANTHROPIC = "anthropic"
     HUGGINGFACE = "huggingface"
     OLLAMA = "ollama"
+    GROQ = "groq"
 
 @dataclass
 class LLMConfig:
@@ -62,6 +63,19 @@ class LLMService:
                 )
             except ImportError:
                 raise ImportError("langchain-anthropic package not installed. Install with: pip install langchain-anthropic")
+        
+        elif config.provider == LLMProvider.GROQ:
+            try:
+                from langchain_groq import ChatGroq
+                return ChatGroq(
+                    model=config.model_name,
+                    temperature=config.temperature,
+                    max_tokens=config.max_tokens,
+                    groq_api_key=config.api_key or os.getenv("GROQ_API_KEY"),
+                    timeout=config.timeout
+                )
+            except ImportError:
+                raise ImportError("langchain-groq package not installed. Install with: pip install langchain-groq")
         
         elif config.provider == LLMProvider.OLLAMA:
             try:
@@ -297,12 +311,11 @@ def get_default_anthropic_service() -> LLMService:
         max_tokens=2000
     )
 
-def get_default_ollama_service(model_name: str = "llama2") -> LLMService:
-    """Get default Ollama service configuration"""
+def get_default_groq_service(model_name: str = "llama3-8b-8192") -> LLMService:
+    """Get default Groq service configuration"""
     return create_llm_service(
-        provider="ollama",
+        provider="groq",
         model_name=model_name,
-        api_base="http://localhost:11434",
         temperature=0.7,
         max_tokens=2000
     )

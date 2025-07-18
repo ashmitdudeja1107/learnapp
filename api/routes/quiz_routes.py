@@ -7,7 +7,8 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
-
+from dotenv import load_dotenv
+load_dotenv()
 from services.quiz_service import QuizService
 from services.llm_service import LLMService, create_llm_service
 from app.rag.quiz_rag import QuizRAGService
@@ -19,19 +20,20 @@ from database.models.quiz_models import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/quiz", tags=["quiz"])
 
-# Initialize Llama3 service for local development
+# Initialize Groq service for development
 def initialize_llama3_service():
-    """Initialize LLM service with local Llama3 model via Ollama"""
+    """Initialize LLM service with Groq Llama3 model"""
     try:
         llm_service = create_llm_service(
-            provider="ollama",
-            model_name="llama3",
+            provider="groq",
+            model_name="llama3-8b-8192",  # Groq's free Llama3 model
+            api_key=os.getenv("GROQ_API_KEY"),
             temperature=0.7,
             max_tokens=2000
         )
         return llm_service
     except Exception as e:
-        raise Exception(f"Could not connect to local Llama3 via Ollama. Make sure Ollama is running: {str(e)}")
+        raise Exception(f"Could not connect to Groq Llama3 service. Make sure GROQ_API_KEY is set: {str(e)}")
 
 # Initialize services
 llm_service = initialize_llama3_service()
@@ -222,7 +224,7 @@ async def generate_quiz_from_uploaded_file(
 @router.post("/generate-from-text")
 async def generate_quiz_from_text(data: TextQuizRequest):
     """
-    Generate quiz questions directly from provided text content using Llama3
+    Generate quiz questions directly from provided text content using Groq Llama3
     """
     try:
         if not data.text_content.strip():
@@ -244,7 +246,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
             logger.info(f"Text quiz cache hit for key: {cache_key}")
             return cached_data
         
-        # Generate questions using Llama3
+        # Generate questions using Groq Llama3
         questions_data = llm_service.generate_quiz_questions(
             content=data.text_content,
             num_questions=data.request.num_questions,
@@ -255,7 +257,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
         if not questions_data:
             raise HTTPException(
                 status_code=422, 
-                detail="Could not generate questions from the provided text using Llama3"
+                detail="Could not generate questions from the provided text using Groq Llama3"
             )
         
         # Process questions
@@ -304,7 +306,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
             except KeyError as e:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Invalid question format from Llama3: missing {str(e)}"
+                    detail=f"Invalid question format from Groq Llama3: missing {str(e)}"
                 )
             except Exception as e:
                 raise HTTPException(
@@ -328,7 +330,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating quiz with Llama3: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating quiz with Groq Llama3: {str(e)}")
 
 @router.post("/evaluate", response_model=QuizResult)
 async def evaluate_quiz(request: SimpleAnswersRequest):
@@ -382,11 +384,23 @@ async def evaluate_quiz(request: SimpleAnswersRequest):
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "storage": "in-memory"
-    }
+    try:
+        # Test Groq connection
+        health_result = llm_service.health_check()
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "storage": "in-memory",
+            "llm_service": health_result
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.now().isoformat(),
+            "storage": "in-memory",
+            "error": str(e)
+        }
 
 @router.delete("/session/{session_id}")
 async def delete_quiz_session(session_id: str):
@@ -426,7 +440,9 @@ async def get_session_stats():
         return {
             "active_sessions": active_sessions,
             "cache_entries": cache_entries,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "llm_provider": "groq",
+            "model": "llama3-8b-8192"
         }
     except Exception as e:
         logger.error(f"Error getting session stats: {str(e)}")
