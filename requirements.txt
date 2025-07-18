@@ -9,6 +9,8 @@ langchain_openai==0.3.28
 langchain_community==0.3.27
 langchain_ollama==0.3.4
 langchain_anthropic==0.3.17
+groq
+langchain-groq
 
 openai==1.95.1
 pydantic==2.11.7
