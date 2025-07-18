@@ -16,14 +16,6 @@ from database.models.quiz_models import (
     QuizQuestion, QuizResult, DifficultyLevel
 )
 
-# Import the new Redis configuration
-from redis_config import (
-    redis_client, is_redis_available, safe_redis_get, safe_redis_setex,
-    safe_redis_delete, safe_redis_exists, get_quiz_cache_key,
-    get_session_cache_key, store_quiz_session_redis, get_quiz_session_redis,
-    cleanup_expired_sessions_redis
-)
-
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/quiz", tags=["quiz"])
 
@@ -45,8 +37,9 @@ def initialize_llama3_service():
 llm_service = initialize_llama3_service()
 quiz_service = QuizService(llm_service.model)
 
-# Fallback in-memory storage for when Redis is unavailable
+# In-memory storage for quiz sessions and cache
 quiz_sessions = {}
+quiz_cache = {}
 
 class SimpleAnswersRequest(BaseModel):
     session_id: str
@@ -65,63 +58,29 @@ class QuizEvaluationRequest(BaseModel):
     questions: List[QuizQuestion]
     submission: QuizSubmission
 
+def get_cache_key(content_hash: str, num_questions: int, difficulty: str) -> str:
+    """Generate cache key for quiz responses"""
+    return f"quiz_{content_hash}_{num_questions}_{difficulty}"
+
 def store_quiz_session(questions: List[QuizQuestion]) -> str:
     """
     Store quiz questions and return session ID
-    Uses Redis if available, fallback to in-memory storage
+    Uses in-memory storage
     """
     session_id = f"quiz_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     
-    # Convert questions to serializable format
-    questions_data = []
-    for q in questions:
-        questions_data.append({
-            'id': q.id,
-            'question': q.question,
-            'options': q.options,
-            'correct_answer': q.correct_answer,
-            'explanation': q.explanation,
-            'difficulty': q.difficulty.value if hasattr(q.difficulty, 'value') else str(q.difficulty),
-            'topic': q.topic
-        })
-    
-    # Try Redis first
-    if store_quiz_session_redis(session_id, questions_data):
-        logger.info(f"Session {session_id} stored in Redis")
-        return session_id
-    
-    # Fallback to in-memory storage
     quiz_sessions[session_id] = {
         'questions': questions,
         'created_at': datetime.now(),
         'expires_at': datetime.now() + timedelta(hours=24)
     }
-    logger.info(f"Session {session_id} stored in memory (Redis unavailable)")
+    logger.info(f"Session {session_id} stored in memory")
     return session_id
 
 def get_quiz_session(session_id: str) -> Optional[List[QuizQuestion]]:
     """
-    Retrieve quiz session from Redis or in-memory storage
+    Retrieve quiz session from in-memory storage
     """
-    # Try Redis first
-    redis_data = get_quiz_session_redis(session_id)
-    if redis_data:
-        # Convert back to QuizQuestion objects
-        questions = []
-        for q_data in redis_data['questions']:
-            question = QuizQuestion(
-                id=q_data['id'],
-                question=q_data['question'],
-                options=q_data['options'],
-                correct_answer=q_data['correct_answer'],
-                explanation=q_data['explanation'],
-                difficulty=DifficultyLevel(q_data['difficulty']),
-                topic=q_data['topic']
-            )
-            questions.append(question)
-        return questions
-    
-    # Fallback to in-memory storage
     if session_id in quiz_sessions:
         session_data = quiz_sessions[session_id]
         if session_data['expires_at'] > datetime.now():
@@ -132,11 +91,7 @@ def get_quiz_session(session_id: str) -> Optional[List[QuizQuestion]]:
     return None
 
 def clean_expired_sessions():
-    """Clean up expired sessions from both Redis and in-memory storage"""
-    # Clean Redis sessions
-    cleanup_expired_sessions_redis()
-    
-    # Clean in-memory sessions
+    """Clean up expired sessions from in-memory storage"""
     current_time = datetime.now()
     expired_sessions = [
         session_id for session_id, data in quiz_sessions.items()
@@ -144,6 +99,31 @@ def clean_expired_sessions():
     ]
     for session_id in expired_sessions:
         del quiz_sessions[session_id]
+    
+    # Also clean expired cache entries
+    expired_cache_keys = [
+        key for key, data in quiz_cache.items()
+        if data['expires_at'] < current_time
+    ]
+    for key in expired_cache_keys:
+        del quiz_cache[key]
+
+def get_cached_response(cache_key: str) -> Optional[Dict]:
+    """Get cached response if available and not expired"""
+    if cache_key in quiz_cache:
+        cache_data = quiz_cache[cache_key]
+        if cache_data['expires_at'] > datetime.now():
+            return cache_data['data']
+        else:
+            del quiz_cache[cache_key]
+    return None
+
+def cache_response(cache_key: str, data: Dict, ttl_seconds: int = 600):
+    """Cache response with TTL"""
+    quiz_cache[cache_key] = {
+        'data': data,
+        'expires_at': datetime.now() + timedelta(seconds=ttl_seconds)
+    }
 
 @router.post("/generate")
 async def generate_quiz_from_uploaded_file(
@@ -171,13 +151,13 @@ async def generate_quiz_from_uploaded_file(
 
         # Generate cache key using hash of file content + params
         file_hash = hashlib.sha256(content).hexdigest()
-        cache_key = get_quiz_cache_key(file_hash, num_questions, difficulty)
+        cache_key = get_cache_key(file_hash, num_questions, difficulty)
 
-        # Check Redis cache
-        cached_data = safe_redis_get(cache_key)
+        # Check cache
+        cached_data = get_cached_response(cache_key)
         if cached_data:
             logger.info(f"Cache hit for key: {cache_key}")
-            return json.loads(cached_data)
+            return cached_data
         
         # Store file temporarily
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
@@ -221,9 +201,8 @@ async def generate_quiz_from_uploaded_file(
         }
 
         # Cache the response with 10 minute TTL
-        cache_success = safe_redis_setex(cache_key, 600, json.dumps(response))
-        if cache_success:
-            logger.info(f"Response cached successfully for key: {cache_key}")
+        cache_response(cache_key, response, 600)
+        logger.info(f"Response cached successfully for key: {cache_key}")
 
         return response
 
@@ -257,13 +236,13 @@ async def generate_quiz_from_text(data: TextQuizRequest):
         
         # Generate cache key for text-based quizzes
         text_hash = hashlib.sha256(data.text_content.encode()).hexdigest()
-        cache_key = get_quiz_cache_key(text_hash, data.request.num_questions, data.request.difficulty)
+        cache_key = get_cache_key(text_hash, data.request.num_questions, data.request.difficulty)
         
         # Check cache first
-        cached_data = safe_redis_get(cache_key)
+        cached_data = get_cached_response(cache_key)
         if cached_data:
             logger.info(f"Text quiz cache hit for key: {cache_key}")
-            return json.loads(cached_data)
+            return cached_data
         
         # Generate questions using Llama3
         questions_data = llm_service.generate_quiz_questions(
@@ -342,7 +321,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
         }
         
         # Cache the response
-        safe_redis_setex(cache_key, 600, json.dumps(response))
+        cache_response(cache_key, response, 600)
         
         return response
         
@@ -402,32 +381,26 @@ async def evaluate_quiz(request: SimpleAnswersRequest):
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint that includes Redis status"""
-    redis_status = "connected" if is_redis_available() else "disconnected"
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "redis_status": redis_status,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "storage": "in-memory"
     }
 
 @router.delete("/session/{session_id}")
 async def delete_quiz_session(session_id: str):
     """Delete a specific quiz session"""
     try:
-        # Try to delete from Redis
-        redis_key = get_session_cache_key(session_id)
-        redis_deleted = safe_redis_delete(redis_key)
-        
-        # Also delete from in-memory storage
-        memory_deleted = session_id in quiz_sessions
-        if memory_deleted:
+        # Delete from in-memory storage
+        if session_id in quiz_sessions:
             del quiz_sessions[session_id]
-        
-        if redis_deleted or memory_deleted:
             return {"message": f"Session {session_id} deleted successfully"}
         else:
             raise HTTPException(status_code=404, detail="Session not found")
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error deleting session {session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
@@ -441,3 +414,20 @@ async def cleanup_sessions():
     except Exception as e:
         logger.error(f"Error during session cleanup: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error during cleanup: {str(e)}")
+
+@router.get("/sessions/stats")
+async def get_session_stats():
+    """Get statistics about active sessions"""
+    try:
+        clean_expired_sessions()
+        active_sessions = len(quiz_sessions)
+        cache_entries = len(quiz_cache)
+        
+        return {
+            "active_sessions": active_sessions,
+            "cache_entries": cache_entries,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting session stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error getting stats: {str(e)}")

@@ -10,6 +10,8 @@ import logging
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import random
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,8 @@ class QuizRAGService:
         )
         self.vector_store = None
         self.documents = []
+        self.content_clusters = []  # For storing content clusters
+        self.used_chunks = set()   # Track used chunks for diversity
     
     def load_document(self, file_path: str) -> List[Document]:
         """
@@ -135,6 +139,35 @@ class QuizRAGService:
         except Exception as e:
             logger.error(f"Error loading document {file_path}: {str(e)}")
             return []
+    
+    def _create_content_clusters(self, documents: List[Document], num_clusters: int = 5) -> List[List[Document]]:
+        """
+        Create content clusters based on content similarity for better diversity
+        """
+        try:
+            if len(documents) <= num_clusters:
+                return [[doc] for doc in documents]
+            
+            # Simple clustering based on content length and keywords
+            clusters = [[] for _ in range(num_clusters)]
+            
+            # Sort documents by length for initial distribution
+            sorted_docs = sorted(documents, key=lambda x: len(x.page_content))
+            
+            # Distribute documents across clusters
+            for i, doc in enumerate(sorted_docs):
+                cluster_idx = i % num_clusters
+                clusters[cluster_idx].append(doc)
+            
+            # Filter out empty clusters
+            self.content_clusters = [cluster for cluster in clusters if cluster]
+            logger.info(f"Created {len(self.content_clusters)} content clusters")
+            
+            return self.content_clusters
+            
+        except Exception as e:
+            logger.error(f"Error creating content clusters: {str(e)}")
+            return [[doc] for doc in documents[:num_clusters]]
     
     def process_document_for_quiz(self, file_path: str) -> List[Document]:
         """
@@ -162,6 +195,10 @@ class QuizRAGService:
                 return []
         
             self.documents = filtered_chunks
+            
+            # Create content clusters for diversity
+            self._create_content_clusters(filtered_chunks)
+            
             logger.info(f"Processed {len(filtered_chunks)} chunks for quiz generation")
         
             return filtered_chunks
@@ -253,9 +290,9 @@ class QuizRAGService:
             logger.error(f"Error retrieving relevant chunks: {str(e)}")
             return []
     
-    def get_diverse_chunks(self, num_chunks: int = 5) -> List[Document]:
+    def get_diverse_chunks(self, num_chunks: int = 5, avoid_recent: bool = True) -> List[Document]:
         """
-        Get diverse chunks from the document for varied quiz questions
+        Get diverse chunks from the document for varied quiz questions with improved diversity
         """
         try:
             if not self.documents:
@@ -265,52 +302,210 @@ class QuizRAGService:
             if len(self.documents) <= num_chunks:
                 return self.documents
             
-            # Use simple strategy to get diverse chunks
-            # Divide documents into sections and pick from each
-            total_docs = len(self.documents)
-            step = max(1, total_docs // num_chunks)
-            
             diverse_chunks = []
-            for i in range(0, total_docs, step):
-                if len(diverse_chunks) < num_chunks:
-                    diverse_chunks.append(self.documents[i])
             
-            # If we still need more chunks, add random ones
-            remaining_docs = [doc for doc in self.documents if doc not in diverse_chunks]
-            while len(diverse_chunks) < num_chunks and remaining_docs:
-                diverse_chunks.append(remaining_docs.pop(0))
+            # Method 1: Use content clusters for diversity
+            if self.content_clusters and len(self.content_clusters) > 1:
+                chunks_per_cluster = max(1, num_chunks // len(self.content_clusters))
+                
+                for cluster in self.content_clusters:
+                    if len(diverse_chunks) >= num_chunks:
+                        break
+                    
+                    # Get chunks from this cluster, avoiding recently used ones
+                    available_chunks = [doc for doc in cluster 
+                                      if avoid_recent and self._get_chunk_hash(doc) not in self.used_chunks]
+                    
+                    if not available_chunks:
+                        available_chunks = cluster  # Use all if no unused chunks
+                    
+                    # Randomly select from available chunks
+                    selected_count = min(chunks_per_cluster, len(available_chunks))
+                    selected_chunks = random.sample(available_chunks, selected_count)
+                    
+                    diverse_chunks.extend(selected_chunks)
             
-            return diverse_chunks[:num_chunks]
+            # Method 2: Fill remaining slots with random diverse selection
+            if len(diverse_chunks) < num_chunks:
+                remaining_docs = [doc for doc in self.documents if doc not in diverse_chunks]
+                
+                if avoid_recent:
+                    # Prefer unused chunks
+                    unused_docs = [doc for doc in remaining_docs 
+                                 if self._get_chunk_hash(doc) not in self.used_chunks]
+                    if unused_docs:
+                        remaining_docs = unused_docs
+                
+                # Add random documents to fill up to num_chunks
+                additional_needed = num_chunks - len(diverse_chunks)
+                if remaining_docs:
+                    additional_chunks = random.sample(
+                        remaining_docs, 
+                        min(additional_needed, len(remaining_docs))
+                    )
+                    diverse_chunks.extend(additional_chunks)
+            
+            # Method 3: Ensure content diversity by checking overlap
+            final_chunks = self._ensure_content_diversity(diverse_chunks[:num_chunks])
+            
+            # Mark these chunks as used
+            for chunk in final_chunks:
+                self.used_chunks.add(self._get_chunk_hash(chunk))
+            
+            # Reset used chunks if we've used too many (for long-running sessions)
+            if len(self.used_chunks) > len(self.documents) * 0.8:
+                self.used_chunks.clear()
+                logger.info("Cleared used chunks cache for better diversity")
+            
+            return final_chunks
             
         except Exception as e:
             logger.error(f"Error getting diverse chunks: {str(e)}")
             return []
     
-    def get_context_for_question_generation(self, topic_hint: str = None, chunk_size: int = 800) -> List[str]:
+    def _get_chunk_hash(self, chunk: Document) -> str:
+        """Generate a hash for a chunk to track usage"""
+        try:
+            content = chunk.page_content[:200]  # Use first 200 chars for hash
+            return hashlib.md5(content.encode()).hexdigest()
+        except Exception:
+            return str(id(chunk))
+    
+    def _ensure_content_diversity(self, chunks: List[Document], min_diversity_threshold: float = 0.3) -> List[Document]:
         """
-        Get contextual information for question generation
+        Ensure content diversity by removing chunks that are too similar
+        """
+        try:
+            if len(chunks) <= 1:
+                return chunks
+            
+            diverse_chunks = [chunks[0]]  # Start with first chunk
+            
+            for chunk in chunks[1:]:
+                is_diverse = True
+                chunk_words = set(chunk.page_content.lower().split())
+                
+                for existing_chunk in diverse_chunks:
+                    existing_words = set(existing_chunk.page_content.lower().split())
+                    
+                    # Calculate Jaccard similarity
+                    if len(chunk_words) > 0 and len(existing_words) > 0:
+                        intersection = len(chunk_words.intersection(existing_words))
+                        union = len(chunk_words.union(existing_words))
+                        similarity = intersection / union if union > 0 else 0
+                        
+                        if similarity > (1 - min_diversity_threshold):
+                            is_diverse = False
+                            break
+                
+                if is_diverse:
+                    diverse_chunks.append(chunk)
+            
+            return diverse_chunks
+            
+        except Exception as e:
+            logger.error(f"Error ensuring content diversity: {str(e)}")
+            return chunks
+    
+    def get_context_for_question_generation(self, topic_hint: str = None, chunk_size: int = 800, 
+                                          force_diversity: bool = True) -> List[str]:
+        """
+        Get contextual information for question generation with enhanced diversity
         """
         try:
             contexts = []
             
+            # Strategy 1: Topic-specific chunks (if topic provided)
             if topic_hint and self.vector_store:
-                # Get topic-specific chunks
-                relevant_chunks = self.retrieve_relevant_chunks(topic_hint, k=3)
+                relevant_chunks = self.retrieve_relevant_chunks(topic_hint, k=2)
                 for chunk in relevant_chunks:
                     context = chunk.page_content[:chunk_size]
                     contexts.append(context)
             
-            # Also get some diverse chunks
-            diverse_chunks = self.get_diverse_chunks(3)
+            # Strategy 2: Diverse chunks from different sections
+            diverse_chunks = self.get_diverse_chunks(4, avoid_recent=force_diversity)
             for chunk in diverse_chunks:
                 context = chunk.page_content[:chunk_size]
                 if context not in contexts:  # Avoid duplicates
                     contexts.append(context)
             
-            return contexts
+            # Strategy 3: Ensure we have enough contexts
+            if len(contexts) < 3:
+                additional_chunks = self.get_diverse_chunks(5, avoid_recent=False)
+                for chunk in additional_chunks:
+                    context = chunk.page_content[:chunk_size]
+                    if context not in contexts and len(contexts) < 6:
+                        contexts.append(context)
+            
+            # Shuffle contexts to randomize order
+            random.shuffle(contexts)
+            
+            return contexts[:6]  # Return max 6 contexts
             
         except Exception as e:
             logger.error(f"Error getting context for question generation: {str(e)}")
+            return []
+    
+    def get_content_chunks_for_quiz(self, num_chunks: int = 5, ensure_diversity: bool = True) -> List[str]:
+        """
+        Get content chunks as strings for quiz generation with enhanced diversity
+        """
+        try:
+            if ensure_diversity:
+                diverse_chunks = self.get_diverse_chunks(num_chunks, avoid_recent=True)
+            else:
+                diverse_chunks = self.get_diverse_chunks(num_chunks, avoid_recent=False)
+            
+            # Convert to strings and add randomization
+            content_strings = [chunk.page_content for chunk in diverse_chunks]
+            
+            # Shuffle to randomize order
+            random.shuffle(content_strings)
+            
+            return content_strings
+            
+        except Exception as e:
+            logger.error(f"Error getting content chunks for quiz: {str(e)}")
+            return []
+    
+    def get_targeted_chunks_by_topic(self, topics: List[str], chunks_per_topic: int = 2) -> List[Document]:
+        """
+        Get chunks targeted to specific topics for more focused quiz generation
+        """
+        try:
+            if not topics or not self.documents:
+                return []
+            
+            targeted_chunks = []
+            
+            for topic in topics:
+                topic_chunks = []
+                topic_lower = topic.lower()
+                
+                # Find chunks that contain the topic
+                for doc in self.documents:
+                    if topic_lower in doc.page_content.lower():
+                        topic_chunks.append(doc)
+                
+                # If we found topic-specific chunks, select randomly from them
+                if topic_chunks:
+                    selected_count = min(chunks_per_topic, len(topic_chunks))
+                    selected_chunks = random.sample(topic_chunks, selected_count)
+                    targeted_chunks.extend(selected_chunks)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_chunks = []
+            for chunk in targeted_chunks:
+                chunk_hash = self._get_chunk_hash(chunk)
+                if chunk_hash not in seen:
+                    seen.add(chunk_hash)
+                    unique_chunks.append(chunk)
+            
+            return unique_chunks
+            
+        except Exception as e:
+            logger.error(f"Error getting targeted chunks by topic: {str(e)}")
             return []
     
     def setup_quiz_rag(self, file_path: str) -> bool:
@@ -353,23 +548,14 @@ class QuizRAGService:
                 "total_chunks": len(self.documents),
                 "total_content_length": total_length,
                 "average_chunk_length": total_length // len(self.documents) if self.documents else 0,
-                "has_vector_store": self.vector_store is not None
+                "has_vector_store": self.vector_store is not None,
+                "content_clusters": len(self.content_clusters),
+                "used_chunks": len(self.used_chunks)
             }
             
         except Exception as e:
             logger.error(f"Error getting document summary: {str(e)}")
             return {"error": str(e)}
-    
-    def get_content_chunks_for_quiz(self, num_chunks: int = 5) -> List[str]:
-        """
-        Get content chunks as strings for quiz generation
-        """
-        try:
-            diverse_chunks = self.get_diverse_chunks(num_chunks)
-            return [chunk.page_content for chunk in diverse_chunks]
-        except Exception as e:
-            logger.error(f"Error getting content chunks for quiz: {str(e)}")
-            return []
     
     def search_documents_by_keywords(self, keywords: List[str], max_results: int = 5) -> List[Document]:
         """
@@ -425,7 +611,9 @@ class QuizRAGService:
                 "min_words": min(word_counts) if word_counts else 0,
                 "max_words": max(word_counts) if word_counts else 0,
                 "vector_store_ready": self.vector_store is not None,
-                "embeddings_fitted": self.embeddings.is_fitted if hasattr(self.embeddings, 'is_fitted') else False
+                "embeddings_fitted": self.embeddings.is_fitted if hasattr(self.embeddings, 'is_fitted') else False,
+                "content_clusters": len(self.content_clusters),
+                "used_chunks": len(self.used_chunks)
             }
             
         except Exception as e:
@@ -459,12 +647,21 @@ class QuizRAGService:
             logger.error(f"Error reinitializing embeddings: {str(e)}")
             return False
     
+    def reset_diversity_tracking(self):
+        """
+        Reset diversity tracking - useful for new quiz sessions
+        """
+        self.used_chunks.clear()
+        logger.info("Diversity tracking reset - all chunks available again")
+    
     def cleanup(self):
         """
         Clean up resources
         """
         self.vector_store = None
         self.documents = []
+        self.content_clusters = []
+        self.used_chunks.clear()
         self.embeddings = TFIDFEmbeddings()
         logger.info("Quiz RAG resources cleaned up")
 
@@ -493,9 +690,13 @@ if __name__ == "__main__":
         stats = quiz_rag.get_document_statistics()
         print(f"Document statistics: {stats}")
         
-        # Get content chunks for quiz generation
-        chunks = quiz_rag.get_content_chunks_for_quiz(3)
-        print(f"Retrieved {len(chunks)} content chunks")
+        # Get diverse content chunks for quiz generation
+        chunks = quiz_rag.get_content_chunks_for_quiz(5, ensure_diversity=True)
+        print(f"Retrieved {len(chunks)} diverse content chunks")
+        
+        # Get context for question generation with diversity
+        contexts = quiz_rag.get_context_for_question_generation(force_diversity=True)
+        print(f"Retrieved {len(contexts)} diverse contexts")
         
         # Search for specific content
         if quiz_rag.vector_store:
