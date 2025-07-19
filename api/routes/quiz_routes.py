@@ -267,25 +267,39 @@ async def generate_quiz_from_text(data: TextQuizRequest):
         for i, q_data in enumerate(questions_data):
             try:
                 options = []
+                correct_answer = q_data.get('correct_answer', 'A')  # Get the correct answer
+                
                 for j, opt in enumerate(q_data['options']):
+                    option_label = chr(65 + j)  # A, B, C, D
+                    
                     if isinstance(opt, dict):
+                        # If option is already a dictionary with structure
                         options.append({
-                            "label": opt.get('label', chr(65 + j)),
+                            "label": opt.get('label', option_label),
                             "text": opt.get('text', str(opt)),
                             "is_correct": opt.get('is_correct', False)
                         })
                     else:
+                        # If option is just text, determine correctness based on correct_answer
+                        is_correct = (option_label == correct_answer.upper())
                         options.append({
-                            "label": chr(65 + j),
+                            "label": option_label,
                             "text": str(opt),
-                            "is_correct": False
+                            "is_correct": is_correct
                         })
+                
+                # Ensure at least one option is marked as correct
+                if not any(opt['is_correct'] for opt in options):
+                    # If no option is marked correct, mark the first one as correct
+                    if options:
+                        options[0]['is_correct'] = True
+                        correct_answer = options[0]['label']
                 
                 question_obj = QuizQuestion(
                     id=q_data.get('id', f'q{i+1}'),
                     question=q_data['question'],
                     options=options,
-                    correct_answer=q_data['correct_answer'],
+                    correct_answer=correct_answer,
                     explanation=q_data.get('explanation', ''),
                     difficulty=DifficultyLevel(q_data.get('difficulty', data.request.difficulty)),
                     topic=q_data.get('topic', 'General')
@@ -296,7 +310,7 @@ async def generate_quiz_from_text(data: TextQuizRequest):
                     "id": q_data.get('id', f'q{i+1}'),
                     "question": q_data['question'],
                     "options": options,
-                    "correct_answer": q_data['correct_answer'],
+                    "correct_answer": correct_answer,
                     "explanation": q_data.get('explanation', ''),
                     "difficulty": q_data.get('difficulty', data.request.difficulty),
                     "topic": q_data.get('topic', 'General')
@@ -332,6 +346,30 @@ async def generate_quiz_from_text(data: TextQuizRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating quiz with Groq Llama3: {str(e)}")
 
+
+# Additional function to improve LLM prompt for better diversity
+def get_diverse_quiz_prompt(content: str, num_questions: int, difficulty: str, question_type: str) -> str:
+    """
+    Generate a prompt that encourages diverse correct answers
+    """
+    return f"""
+    Create {num_questions} {difficulty} {question_type} questions from the following content.
+    
+    IMPORTANT: Distribute correct answers across different options (A, B, C, D) to ensure variety.
+    Avoid making all correct answers the same option.
+    
+    For each question, provide:
+    - question: the question text
+    - options: array of 4 answer choices
+    - correct_answer: the letter of the correct option (A, B, C, or D)
+    - explanation: brief explanation of why the answer is correct
+    - difficulty: {difficulty}
+    - topic: relevant topic from the content
+    
+    Content: {content}
+    
+    Return as JSON array with diverse correct_answer distribution.
+    """
 @router.post("/evaluate", response_model=QuizResult)
 async def evaluate_quiz(request: SimpleAnswersRequest):
     """
