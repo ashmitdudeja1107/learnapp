@@ -26,7 +26,7 @@ def initialize_llama3_service():
     try:
         llm_service = create_llm_service(
             provider="groq",
-            model_name="llama3-8b-8192",  # Groq's free Llama3 model
+            model_name="llama-3.1-8b-instant",  # Groq's free Llama3 model
             api_key=os.getenv("GROQ_API_KEY"),
             temperature=0.7,
             max_tokens=2000
@@ -480,8 +480,9 @@ async def get_session_stats():
             "cache_entries": cache_entries,
             "timestamp": datetime.now().isoformat(),
             "llm_provider": "groq",
-            "model": "llama3-8b-8192"
+            "model": "llama-3.1-8b-instant"
         }
     except Exception as e:
         logger.error(f"Error getting session stats: {str(e)}")
+
         raise HTTPException(status_code=500, detail=f"Error getting stats: {str(e)}")
