@@ -311,11 +311,12 @@ def get_default_anthropic_service() -> LLMService:
         max_tokens=2000
     )
 
-def get_default_groq_service(model_name: str = "llama3-8b-8192") -> LLMService:
+def get_default_groq_service(model_name: str = "llama-3.1-8b-instant") -> LLMService:
     """Get default Groq service configuration"""
     return create_llm_service(
         provider="groq",
         model_name=model_name,
         temperature=0.7,
         max_tokens=2000
+
     )
