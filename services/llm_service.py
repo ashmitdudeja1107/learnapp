@@ -318,4 +318,5 @@ def get_default_groq_service(model_name: str = "llama-3.1-8b-instant") -> LLMSer
         model_name=model_name,
         temperature=0.7,
         max_tokens=2000
+
     )

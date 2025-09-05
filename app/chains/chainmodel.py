@@ -167,4 +167,5 @@ Explanation:"""
             return response
         except Exception as e:
             logger.error(f"Error explaining concept: {str(e)}")
+
             return f"I apologize, but I encountered an error while explaining the concept '{concept}'. Please try again."
