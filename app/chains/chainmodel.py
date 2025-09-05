@@ -10,7 +10,7 @@ from services.llm_service import create_llm_service, LLMService  # Adjust import
 logger = logging.getLogger(__name__)
 
 class TutorChains:
-    def __init__(self, model_name: str = "llama3-8b-8192"):
+    def __init__(self, model_name: str = "llama-3.1-8b-instant"):
         # Initialize with Groq LLM service using the same model as LLMService
         self.llm_service = create_llm_service(
             provider="groq",
